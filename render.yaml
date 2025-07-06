@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: reddit-analyzer-api
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn reddit_api:app --bind 0.0.0.0:$PORT"
+    envVars:
+      - key: REDDIT_CLIENT_ID
+        sync: false
+      - key: REDDIT_CLIENT_SECRET
+        sync: false
+      - key: REDDIT_USER_AGENT
+        value: RedditAnalyzer/1.0 by YourUsername
