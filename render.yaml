@@ -11,3 +11,5 @@ services:
         sync: false
       - key: REDDIT_USER_AGENT
         value: RedditAnalyzer/1.0 by YourUsername
+    python:
+      version: 3.11.0
