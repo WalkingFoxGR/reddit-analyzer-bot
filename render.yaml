@@ -10,5 +10,6 @@ services:
       - key: REDDIT_CLIENT_SECRET
         sync: false
       - key: REDDIT_USER_AGENT
-        value: RedditAnalyzer/1.0 by YourUsername
-    pythonVersion: "3.11.0"  # This should force the version
+        value: RedditAnalyzer/1.0 by WalkingFoxGR
+    python:
+      version: "3.11"  
