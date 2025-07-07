@@ -195,13 +195,15 @@ def search_and_analyze_endpoint():
     # Search for subreddits
     subreddits = analyzer.find_subreddits(query, limit)
     
-for sub in subreddits:
-    result = analyzer.analyze_subreddit(sub, days)
-    if result['success']:
-        results.append(result)
-    time.sleep(0.2)
-
-
+    # Initialize results list (THIS WAS MISSING!)
+    results = []
+    
+    # Analyze each subreddit (THIS WAS NOT INDENTED PROPERLY!)
+    for sub in subreddits:
+        result = analyzer.analyze_subreddit(sub, days)
+        if result['success']:
+            results.append(result)
+        time.sleep(0.2)
     
     # Sort by effectiveness
     results.sort(key=lambda x: x.get('effectiveness_score', 0), reverse=True)
@@ -235,7 +237,6 @@ def format_for_telegram(query: str, results: List[Dict]) -> str:
         message += f"   • Posts/Day: {r['avg_posts_per_day']}\n\n"
     
     return message
-
 
 # Add this to your Flask app to keep it warm
 @app.route('/health', methods=['GET'])
