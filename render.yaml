@@ -9,9 +9,12 @@ services:
                --worker-class gthread
                --threads 4
                --workers 2
-               --timeout 180
+               --timeout 300
+               --keep-alive 300
+               --max-requests 1000
+               --max-requests-jitter 100
     envVars:
       - key: GUNICORN_CMD_ARGS
-        value: "--log-level info"
+        value: "--log-level info --access-logfile -"
     python:
-      version: "3.11"  
+      version: "3.11"
