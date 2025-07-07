@@ -107,29 +107,78 @@ class RedditAnalyzer:
             logging.error(f"Error analyzing subreddit {subreddit_name}: {e}")
             return {'success': False, 'error': str(e)}
     
-    def find_subreddits(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Search for subreddits by niche and return sorted by subscribers"""
-        try:
-            subreddits = []
+def find_subreddits(self, query: str, limit: int = 50, search_type: str = "search") -> List[Dict[str, Any]]:
+    """Search for subreddits with different strategies based on search type"""
+    try:
+        subreddits = []
+        
+        if search_type == "niche":
+            # For niche: Focus on smaller, more targeted communities
+            for sub in self.reddit.subreddits.search(query, limit=limit*2):
+                try:
+                    # Filter for smaller, more engaged communities
+                    if sub.subscribers and 1000 <= sub.subscribers <= 500000:
+                        subreddits.append({
+                            'name': sub.display_name,
+                            'subscribers': sub.subscribers or 0,
+                            'description': sub.public_description[:100] if sub.public_description else "",
+                            'type': 'niche'
+                        })
+                    time.sleep(0.1)
+                except Exception as e:
+                    continue
+            
+            # Sort by engagement potential (smaller but active communities)
+            subreddits.sort(key=lambda x: x['subscribers'], reverse=False)
+            
+        else:
+            # For search: Focus on popular, established communities
             for sub in self.reddit.subreddits.search(query, limit=limit):
                 try:
                     subreddits.append({
                         'name': sub.display_name,
                         'subscribers': sub.subscribers or 0,
-                        'description': sub.public_description[:100] if sub.public_description else ""
+                        'description': sub.public_description[:100] if sub.public_description else "",
+                        'type': 'popular'
                     })
-                    time.sleep(0.1)  # Rate limiting
+                    time.sleep(0.1)
                 except Exception as e:
-                    logging.warning(f"Error getting subreddit info for {sub.display_name}: {e}")
                     continue
             
-            # Sort by subscribers (descending) - best ones first
+            # Sort by popularity (largest communities first)
             subreddits.sort(key=lambda x: x['subscribers'], reverse=True)
-            return subreddits
-            
-        except Exception as e:
-            logging.error(f"Error searching subreddits: {e}")
-            return []
+        
+        return subreddits[:limit]
+        
+    except Exception as e:
+        logging.error(f"Error searching subreddits: {e}")
+        return []
+
+def get_random_subreddits(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Get randomized subreddit results"""
+    try:
+        import random
+        
+        # Get more results than needed
+        all_subreddits = []
+        for sub in self.reddit.subreddits.search(query, limit=limit*3):
+            try:
+                all_subreddits.append({
+                    'name': sub.display_name,
+                    'subscribers': sub.subscribers or 0,
+                    'description': sub.public_description[:100] if sub.public_description else ""
+                })
+                time.sleep(0.1)
+            except Exception as e:
+                continue
+        
+        # Randomize and return subset
+        random.shuffle(all_subreddits)
+        return all_subreddits[:limit]
+        
+    except Exception as e:
+        logging.error(f"Error getting random subreddits: {e}")
+        return []
 
     def parse_compare_input(self, input_text: str) -> List[str]:
         """Parse flexible compare input formats"""
