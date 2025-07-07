@@ -6,6 +6,7 @@ import os
 from typing import List, Dict, Any
 import logging
 import time
+import re
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +21,8 @@ class RedditAnalyzer:
         self.reddit = praw.Reddit(
             client_id=REDDIT_CLIENT_ID,
             client_secret=REDDIT_CLIENT_SECRET,
-            user_agent=REDDIT_USER_AGENT
+            user_agent=REDDIT_USER_AGENT,
+            ratelimit_seconds=300  # Increased rate limit handling
         )
     
     def calculate_effectiveness(self, avg_posts_per_day: float, avg_score_per_post: float,
@@ -59,7 +61,7 @@ class RedditAnalyzer:
         return min(100, max(0, effectiveness))
     
     def analyze_subreddit(self, subreddit_name: str, days: int = 30) -> Dict[str, Any]:
-        """Analyze a single subreddit"""
+        """Analyze a single subreddit with better error handling"""
         try:
             subreddit = self.reddit.subreddit(subreddit_name)
             subscribers = subreddit.subscribers
@@ -69,7 +71,8 @@ class RedditAnalyzer:
             total_score = 0
             total_comments = 0
             
-            for post in subreddit.new(limit=1000):
+            # Reduced limit to avoid timeouts
+            for post in subreddit.new(limit=500):
                 post_date = datetime.utcfromtimestamp(post.created_utc)
                 if post_date < date_threshold:
                     break
@@ -77,6 +80,10 @@ class RedditAnalyzer:
                 post_count += 1
                 total_score += post.score
                 total_comments += post.num_comments
+                
+                # Add small delay to respect rate limits
+                if post_count % 50 == 0:
+                    time.sleep(1)
             
             avg_posts_per_day = post_count / days
             avg_score_per_post = total_score / post_count if post_count > 0 else 0
@@ -97,29 +104,54 @@ class RedditAnalyzer:
                 'effectiveness_score': round(effectiveness, 2)
             }
         except Exception as e:
+            logging.error(f"Error analyzing subreddit {subreddit_name}: {e}")
             return {'success': False, 'error': str(e)}
     
-    def find_subreddits(self, query: str, limit: int = 10) -> List[str]:
-        """Search for subreddits by niche"""
+    def find_subreddits(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Search for subreddits by niche and return sorted by subscribers"""
         try:
-            return [sub.display_name for sub in self.reddit.subreddits.search(query, limit=limit)]
+            subreddits = []
+            for sub in self.reddit.subreddits.search(query, limit=limit):
+                try:
+                    subreddits.append({
+                        'name': sub.display_name,
+                        'subscribers': sub.subscribers or 0,
+                        'description': sub.public_description[:100] if sub.public_description else ""
+                    })
+                    time.sleep(0.1)  # Rate limiting
+                except Exception as e:
+                    logging.warning(f"Error getting subreddit info for {sub.display_name}: {e}")
+                    continue
+            
+            # Sort by subscribers (descending) - best ones first
+            subreddits.sort(key=lambda x: x['subscribers'], reverse=True)
+            return subreddits
+            
         except Exception as e:
             logging.error(f"Error searching subreddits: {e}")
             return []
 
+    def parse_compare_input(self, input_text: str) -> List[str]:
+        """Parse flexible compare input formats"""
+        # Remove extra spaces and split by various delimiters
+        cleaned = re.sub(r'\s+', ' ', input_text.strip())
+        
+        # Split by comma, space, or other common delimiters
+        subreddits = re.split(r'[,\s]+', cleaned)
+        
+        # Clean up each subreddit name
+        return [sub.strip() for sub in subreddits if sub.strip()]
+
 # Initialize analyzer
 analyzer = RedditAnalyzer()
 
-# API Endpoints for n8n
+# API Endpoints
 @app.route('/analyze', methods=['POST'])
 def analyze_endpoint():
-    """
-    Endpoint to analyze a single subreddit
-    Expected JSON: {"subreddit": "name", "days": 30}
-    """
+    """Endpoint to analyze a single subreddit"""
     data = request.json
     subreddit = data.get('subreddit')
-    days = data.get('days', 30)
+    days = data.get('days', 7)  # Reduced default days
     
     if not subreddit:
         return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
@@ -129,20 +161,25 @@ def analyze_endpoint():
 
 @app.route('/analyze-multiple', methods=['POST'])
 def analyze_multiple_endpoint():
-    """
-    Endpoint to analyze multiple subreddits
-    Expected JSON: {"subreddits": ["sub1", "sub2"], "days": 30}
-    """
+    """Endpoint to analyze multiple subreddits"""
     data = request.json
-    subreddits = data.get('subreddits', [])
-    days = data.get('days', 30)
+    subreddits_input = data.get('subreddits', [])
+    days = data.get('days', 7)
+    
+    # Handle flexible input format
+    if isinstance(subreddits_input, str):
+        subreddits = analyzer.parse_compare_input(subreddits_input)
+    else:
+        subreddits = subreddits_input
     
     if not subreddits:
         return jsonify({'success': False, 'error': 'No subreddits provided'}), 400
     
     results = []
-    for sub in subreddits:
-        time.sleep(1)  # Rate limiting
+    for i, sub in enumerate(subreddits):
+        if i > 0:  # Rate limiting between requests
+            time.sleep(2)
+        
         result = analyzer.analyze_subreddit(sub, days)
         if result['success']:
             results.append(result)
@@ -158,99 +195,70 @@ def analyze_multiple_endpoint():
 
 @app.route('/search', methods=['POST'])
 def search_endpoint():
-    """
-    Search for subreddits by niche
-    Expected JSON: {"query": "machine learning", "limit": 10}
-    """
+    """Search for subreddits by niche - returns best ones first"""
     data = request.json
     query = data.get('query')
-    limit = data.get('limit', 10)
+    limit = min(data.get('limit', 50), 100)  # Cap at 100 to avoid timeouts
     
     if not query:
         return jsonify({'success': False, 'error': 'No search query provided'}), 400
     
     subreddits = analyzer.find_subreddits(query, limit)
     
+    # Return just the names for compatibility, but sorted by quality
+    subreddit_names = [sub['name'] for sub in subreddits]
+    
     return jsonify({
         'success': True,
         'query': query,
-        'count': len(subreddits),
-        'subreddits': subreddits
+        'count': len(subreddit_names),
+        'subreddits': subreddit_names
     })
 
 @app.route('/search-and-analyze', methods=['POST'])
 def search_and_analyze_endpoint():
-    """
-    Search for subreddits and analyze them in one go
-    Expected JSON: {"query": "cryptocurrency", "limit": 10, "days": 30}
-    """
+    """Search for subreddits and analyze them - optimized version"""
     data = request.json
     query = data.get('query')
-    limit = data.get('limit', 10)
-    days = data.get('days', 30)
+    limit = min(data.get('limit', 20), 20)  # Reduced limit to prevent timeouts
+    days = data.get('days', 7)
     
     if not query:
         return jsonify({'success': False, 'error': 'No search query provided'}), 400
     
     # Search for subreddits
-    subreddits = analyzer.find_subreddits(query, limit)
+    subreddits_data = analyzer.find_subreddits(query, limit)
     
-    # Initialize results list (THIS WAS MISSING!)
+    # Analyze top subreddits (by subscribers)
     results = []
-    
-    # Analyze each subreddit (THIS WAS NOT INDENTED PROPERLY!)
-    for sub in subreddits:
-        result = analyzer.analyze_subreddit(sub, days)
+    for i, sub_data in enumerate(subreddits_data[:10]):  # Analyze only top 10
+        if i > 0:
+            time.sleep(2)  # Rate limiting
+            
+        result = analyzer.analyze_subreddit(sub_data['name'], days)
         if result['success']:
             results.append(result)
-        time.sleep(0.2)
     
     # Sort by effectiveness
     results.sort(key=lambda x: x.get('effectiveness_score', 0), reverse=True)
-    
-    # Format for Telegram
-    telegram_message = format_for_telegram(query, results)
     
     return jsonify({
         'success': True,
         'query': query,
         'count': len(results),
-        'results': results,
-        'telegram_message': telegram_message
+        'results': results
     })
 
-def format_for_telegram(query: str, results: List[Dict]) -> str:
-    """Format results for Telegram message"""
-    if not results:
-        return f"❌ No subreddits found for '{query}'"
-    
-    message = f"📊 *Reddit Analysis for '{query}'*\n"
-    message += f"_Analyzed {len(results)} subreddits_\n\n"
-    
-    for i, r in enumerate(results[:5], 1):  # Top 5
-        emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "📌"
-        message += f"{emoji} *r/{r['subreddit']}*\n"
-        message += f"   • Effectiveness: *{r['effectiveness_score']}*\n"
-        message += f"   • Subscribers: {r['subscribers']:,}\n"
-        message += f"   • Avg Score: {r['avg_score_per_post']}\n"
-        message += f"   • Avg Comments: {r['avg_comments_per_post']}\n"
-        message += f"   • Posts/Day: {r['avg_posts_per_day']}\n\n"
-    
-    return message
-
-# Add this to your Flask app to keep it warm
+# Health check endpoints
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for monitoring"""
     return jsonify({'status': 'healthy', 'service': 'reddit-analyzer'})
 
-# Add this to prevent timeouts
 @app.route('/ping', methods=['GET'])
 def ping():
     """Simple ping endpoint to keep service warm"""
     return jsonify({'message': 'pong', 'timestamp': datetime.utcnow().isoformat()})
 
 if __name__ == '__main__':
-    # Run on port 5000 for local development
-    # In production, use gunicorn: gunicorn reddit_api:app
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)
