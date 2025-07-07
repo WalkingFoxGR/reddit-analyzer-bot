@@ -32,7 +32,37 @@ class RedditAnalyzer:
             'funny', 'pics', 'gifs', 'videos', 'askreddit', 'todayilearned',
             'worldnews', 'news', 'aww', 'gaming', 'movies', 'music',
             'television', 'books', 'art', 'food', 'jokes', 'tifu',
-            'showerthoughts', 'iama', 'all', 'popular', 'random'
+            'showerthoughts', 'iama', 'all', 'popular', 'random',
+            'teenagers', 'askouija', 'polandball', 'askfrance', 'egg_irl'
+        }
+        
+        # Category mappings for better search results
+        self.category_keywords = {
+            'technology': ['technology', 'tech', 'gadgets', 'programming', 'coding', 'software'],
+            'finance': ['finance', 'investing', 'stocks', 'crypto', 'money', 'trading'],
+            'fitness': ['fitness', 'gym', 'workout', 'exercise', 'health', 'nutrition'],
+            'gaming': ['gaming', 'games', 'pcgaming', 'console', 'esports'],
+            'fashion': ['fashion', 'style', 'clothing', 'streetwear', 'sneakers'],
+            'food': ['food', 'cooking', 'recipes', 'foodporn', 'baking'],
+            'cars': ['cars', 'autos', 'vehicles', 'racing', 'motorcycles'],
+            'sports': ['sports', 'football', 'basketball', 'soccer', 'baseball'],
+            'music': ['music', 'hiphop', 'rock', 'electronic', 'jazz', 'metal'],
+            'art': ['art', 'drawing', 'painting', 'digital', 'illustration'],
+            'science': ['science', 'physics', 'chemistry', 'biology', 'space'],
+            'travel': ['travel', 'backpacking', 'solo', 'destinations', 'tourism'],
+            'photography': ['photography', 'photos', 'cameras', 'photocritique'],
+            'movies': ['movies', 'films', 'cinema', 'moviesuggestions'],
+            'books': ['books', 'reading', 'literature', 'booksuggestions'],
+            'anime': ['anime', 'manga', 'animemes', 'animesuggest'],
+            'politics': ['politics', 'political', 'news', 'worldpolitics'],
+            'business': ['business', 'entrepreneur', 'startup', 'smallbusiness'],
+            'education': ['education', 'learning', 'study', 'college', 'university'],
+            'relationships': ['relationships', 'dating', 'advice', 'love'],
+            'pets': ['pets', 'dogs', 'cats', 'animals', 'aww'],
+            'diy': ['diy', 'crafts', 'woodworking', 'makers', 'howto'],
+            'beauty': ['beauty', 'makeup', 'skincare', 'hair', 'cosmetics'],
+            'parenting': ['parenting', 'parents', 'mommit', 'daddit', 'babies'],
+            'mental_health': ['mentalhealth', 'anxiety', 'depression', 'therapy', 'wellness']
         }
     
     def calculate_effectiveness(self, avg_posts_per_day: float, avg_score_per_post: float,
@@ -70,120 +100,135 @@ class RedditAnalyzer:
         
         return min(100, max(0, effectiveness))
     
-    def find_related_subreddits(self, seed_subreddit: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Find related subreddits using user overlap analysis"""
-        try:
-            related_subs = defaultdict(int)
-            users_analyzed = set()
-            
-            # Get the seed subreddit
-            try:
-                subreddit = self.reddit.subreddit(seed_subreddit)
-                seed_subscribers = subreddit.subscribers
-            except:
-                logging.error(f"Could not find subreddit: {seed_subreddit}")
-                return []
-            
-            # Analyze top posts from the last week
-            for post in subreddit.top(time_filter='week', limit=25):
-                try:
-                    # Get the author
-                    if post.author and post.author.name not in users_analyzed:
-                        users_analyzed.add(post.author.name)
-                        
-                        # Check their recent posts in other subreddits
-                        for user_post in post.author.submissions.new(limit=100):
-                            sub_name = user_post.subreddit.display_name.lower()
-                            
-                            # Skip if it's the same subreddit or a generic one
-                            if sub_name != seed_subreddit.lower() and sub_name not in self.generic_subreddits:
-                                related_subs[user_post.subreddit.display_name] += 1
-                        
-                        # Small delay to respect rate limits
-                        time.sleep(0.1)
-                    
-                    # Also check top commenters
-                    post.comments.replace_more(limit=0)
-                    for comment in post.comments[:10]:  # Top 10 comments
-                        if comment.author and comment.author.name not in users_analyzed:
-                            users_analyzed.add(comment.author.name)
-                            
-                            # Check their activity
-                            try:
-                                for user_comment in comment.author.comments.new(limit=50):
-                                    sub_name = user_comment.subreddit.display_name.lower()
-                                    if sub_name != seed_subreddit.lower() and sub_name not in self.generic_subreddits:
-                                        related_subs[user_comment.subreddit.display_name] += 1
-                            except:
-                                continue
-                            
-                            time.sleep(0.1)
-                    
-                except Exception as e:
-                    logging.warning(f"Error analyzing post/user: {e}")
-                    continue
-                
-                # Limit analysis time
-                if len(users_analyzed) >= 50:
+    def detect_category(self, query: str) -> List[str]:
+        """Detect if query matches any known categories"""
+        query_lower = query.lower()
+        matched_categories = []
+        
+        for category, keywords in self.category_keywords.items():
+            for keyword in keywords:
+                if keyword in query_lower or query_lower in keyword:
+                    matched_categories.append(category)
                     break
-            
-            # Sort by overlap count and get subreddit info
-            sorted_subs = sorted(related_subs.items(), key=lambda x: x[1], reverse=True)[:limit]
-            
-            results = []
-            for sub_name, overlap_count in sorted_subs:
-                try:
-                    sub = self.reddit.subreddit(sub_name)
-                    results.append({
-                        'name': sub.display_name,
-                        'subscribers': sub.subscribers or 0,
-                        'overlap_score': overlap_count,
-                        'description': sub.public_description[:100] if sub.public_description else ""
-                    })
-                except:
-                    continue
-            
-            return results
-            
-        except Exception as e:
-            logging.error(f"Error finding related subreddits: {e}")
-            return []
+        
+        return matched_categories
+    
+    def get_top_subreddits_by_category(self, categories: List[str], limit: int = 50) -> List[Dict[str, Any]]:
+        """Get top subreddits for specific categories"""
+        subreddits = {}
+        
+        # Predefined top subreddits for common categories
+        category_subs = {
+            'technology': ['technology', 'gadgets', 'tech', 'futurology', 'android', 'apple', 'hardware'],
+            'finance': ['personalfinance', 'investing', 'stocks', 'cryptocurrency', 'wallstreetbets', 'financialindependence'],
+            'fitness': ['fitness', 'gym', 'bodybuilding', 'running', 'weightlifting', 'yoga', 'crossfit'],
+            'gaming': ['gaming', 'pcgaming', 'ps5', 'xbox', 'nintendoswitch', 'steam', 'gamingsuggestions'],
+            'crypto': ['cryptocurrency', 'bitcoin', 'ethereum', 'cryptomarkets', 'altcoin', 'defi', 'cryptomoonshots'],
+            'programming': ['programming', 'learnprogramming', 'webdev', 'javascript', 'python', 'coding'],
+            'fashion': ['malefashionadvice', 'femalefashionadvice', 'streetwear', 'sneakers', 'fashionreps'],
+            'cars': ['cars', 'autos', 'carporn', 'projectcar', 'whatcarshouldibuy', 'mechanicadvice'],
+            'photography': ['photography', 'photocritique', 'itookapicture', 'cameras', 'analogcommunity'],
+            'anime': ['anime', 'animemes', 'animesuggest', 'manga', 'animeirl', 'wholesomeanimemes'],
+            'food': ['food', 'cooking', 'recipes', 'foodporn', 'mealprepsunday', 'baking', 'eatcheapandhealthy']
+        }
+        
+        for category in categories:
+            if category in category_subs:
+                for sub_name in category_subs[category]:
+                    try:
+                        sub = self.reddit.subreddit(sub_name)
+                        subreddits[sub_name] = {
+                            'name': sub.display_name,
+                            'subscribers': sub.subscribers or 0,
+                            'relevance': 100,  # High relevance for curated lists
+                            'description': sub.public_description[:100] if sub.public_description else ""
+                        }
+                    except:
+                        continue
+        
+        return list(subreddits.values())
     
     def smart_search_subreddits(self, query: str, limit: int = 50, mode: str = 'search') -> List[Dict[str, Any]]:
         """Smart search that finds truly related subreddits"""
         try:
             all_subreddits = {}
             query_lower = query.lower()
-            query_terms = query_lower.split()
             
-            # Method 1: Direct Reddit search (but filtered)
-            for sub in self.reddit.subreddits.search(query, limit=limit*2):
+            # First, check if this matches any known categories
+            categories = self.detect_category(query)
+            if categories:
+                category_subs = self.get_top_subreddits_by_category(categories, limit)
+                for sub in category_subs:
+                    all_subreddits[sub['name']] = sub
+            
+            # Clean up the query for better search
+            # Remove common words that lead to bad results
+            stop_words = {'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for'}
+            query_terms = [term for term in query_lower.split() if term not in stop_words]
+            clean_query = ' '.join(query_terms)
+            
+            # Method 1: Search for exact subreddit names first
+            exact_searches = [
+                query,
+                query.replace(' ', ''),  # nospace
+                query.replace(' ', '_'),  # underscore
+                clean_query,
+                clean_query.replace(' ', '')
+            ]
+            
+            for search_term in exact_searches:
+                try:
+                    # Try to get subreddit directly
+                    sub = self.reddit.subreddit(search_term)
+                    if sub.subscribers and sub.subscribers > 100:  # Must have some subscribers
+                        all_subreddits[sub.display_name] = {
+                            'name': sub.display_name,
+                            'subscribers': sub.subscribers,
+                            'relevance': 100,
+                            'description': sub.public_description[:100] if sub.public_description else ""
+                        }
+                except:
+                    pass
+            
+            # Method 2: Reddit search with strict filtering
+            search_limit = min(limit * 3, 300)  # Search more to filter down
+            
+            for sub in self.reddit.subreddits.search(clean_query, limit=search_limit):
                 try:
                     sub_name_lower = sub.display_name.lower()
                     
-                    # Skip generic subreddits
-                    if sub_name_lower in self.generic_subreddits:
+                    # Skip if already found or generic
+                    if sub.display_name in all_subreddits or sub_name_lower in self.generic_subreddits:
                         continue
                     
-                    # Check if the subreddit is actually related to the query
-                    description_lower = (sub.public_description or '').lower()
-                    title_lower = (sub.title or '').lower()
+                    # Skip if subscriber count is too low
+                    if not sub.subscribers or sub.subscribers < 1000:
+                        continue
                     
-                    # Score based on relevance
+                    # Calculate relevance more strictly
                     relevance_score = 0
-                    for term in query_terms:
-                        if term in sub_name_lower:
-                            relevance_score += 3
-                        if term in title_lower:
-                            relevance_score += 2
-                        if term in description_lower:
-                            relevance_score += 1
+                    name_matches = 0
                     
-                    # Only include if there's some relevance
-                    if relevance_score > 0:
+                    for term in query_terms:
+                        if len(term) > 2:  # Skip very short terms
+                            # Exact word match in name (not just substring)
+                            if term in sub_name_lower.split('_') or term in re.split(r'(?=[A-Z])', sub.display_name):
+                                relevance_score += 20
+                                name_matches += 1
+                            # Substring match in name
+                            elif term in sub_name_lower:
+                                relevance_score += 10
+                                name_matches += 1
+                            # Match in title (first few words matter more)
+                            title_words = (sub.title or '').lower().split()[:10]
+                            if term in title_words:
+                                relevance_score += 5 - title_words.index(term) * 0.5
+                    
+                    # Require at least partial name match for most queries
+                    if name_matches > 0 or relevance_score >= 15:
                         all_subreddits[sub.display_name] = {
                             'name': sub.display_name,
-                            'subscribers': sub.subscribers or 0,
+                            'subscribers': sub.subscribers,
                             'relevance': relevance_score,
                             'description': sub.public_description[:100] if sub.public_description else ""
                         }
@@ -192,69 +237,38 @@ class RedditAnalyzer:
                     logging.warning(f"Error processing subreddit: {e}")
                     continue
             
-            # Method 2: Search for variations of the query
-            variations = [
-                query,
-                query.replace(' ', ''),  # spaceless
-                query.replace(' ', '_'),  # underscored
-                f"{query}s",  # plural
-                f"the{query}",  # with "the"
-                f"{query}community",
-                f"{query}discussion"
-            ]
-            
-            for variation in variations:
-                try:
-                    for sub in self.reddit.subreddits.search(variation, limit=20):
-                        sub_name_lower = sub.display_name.lower()
-                        
-                        if sub_name_lower not in self.generic_subreddits and sub.display_name not in all_subreddits:
-                            all_subreddits[sub.display_name] = {
-                                'name': sub.display_name,
-                                'subscribers': sub.subscribers or 0,
-                                'relevance': 1,
-                                'description': sub.public_description[:100] if sub.public_description else ""
-                            }
-                    time.sleep(0.5)
-                except:
-                    continue
-            
-            # Method 3: If we found a main subreddit, find related ones
-            if all_subreddits:
-                # Find the largest relevant subreddit
-                largest_sub = max(all_subreddits.values(), key=lambda x: x['subscribers'])
-                if largest_sub['subscribers'] > 10000:  # Only if it's established
-                    related = self.find_related_subreddits(largest_sub['name'], limit=30)
-                    for sub_data in related:
-                        if sub_data['name'] not in all_subreddits:
-                            all_subreddits[sub_data['name']] = sub_data
-            
-            # Convert to list and sort
+            # Convert to list
             results = list(all_subreddits.values())
+            
+            # Remove duplicates and sort
+            seen = set()
+            unique_results = []
+            for r in results:
+                if r['name'] not in seen:
+                    seen.add(r['name'])
+                    unique_results.append(r)
             
             if mode == 'search':
                 # For /search: Sort by subscribers (largest first)
-                results.sort(key=lambda x: x['subscribers'], reverse=True)
+                unique_results.sort(key=lambda x: x['subscribers'], reverse=True)
             else:  # mode == 'niche'
                 # For /niche: Find sweet spot - active but not too large
-                for sub in results:
-                    # Calculate niche score (favors 10k-500k subscriber range)
+                for sub in unique_results:
                     subs = sub['subscribers']
                     if subs < 10000:
-                        sub['niche_score'] = subs / 10000 * 50  # 0-50 points
+                        sub['niche_score'] = subs / 10000 * 50
                     elif subs < 100000:
-                        sub['niche_score'] = 90  # Sweet spot
+                        sub['niche_score'] = 90
                     elif subs < 500000:
                         sub['niche_score'] = 80
                     else:
-                        sub['niche_score'] = 60 - (min(subs, 2000000) - 500000) / 1500000 * 40
+                        sub['niche_score'] = 60 - min((subs - 500000) / 1500000 * 40, 40)
                     
-                    # Boost by relevance
-                    sub['niche_score'] += sub.get('relevance', 0) * 5
+                    sub['niche_score'] += sub.get('relevance', 0) * 0.5
                 
-                results.sort(key=lambda x: x.get('niche_score', 0), reverse=True)
+                unique_results.sort(key=lambda x: x.get('niche_score', 0), reverse=True)
             
-            return results[:limit]
+            return unique_results[:limit]
             
         except Exception as e:
             logging.error(f"Error in smart search: {e}")
