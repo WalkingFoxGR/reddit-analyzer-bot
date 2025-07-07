@@ -7,7 +7,6 @@ from typing import List, Dict, Any
 import logging
 import time
 import re
-import random
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +22,7 @@ class RedditAnalyzer:
             client_id=REDDIT_CLIENT_ID,
             client_secret=REDDIT_CLIENT_SECRET,
             user_agent=REDDIT_USER_AGENT,
-            ratelimit_seconds=300
+            ratelimit_seconds=300  # Increased rate limit handling
         )
     
     def calculate_effectiveness(self, avg_posts_per_day: float, avg_score_per_post: float,
@@ -108,75 +107,28 @@ class RedditAnalyzer:
             logging.error(f"Error analyzing subreddit {subreddit_name}: {e}")
             return {'success': False, 'error': str(e)}
     
-    def find_subreddits(self, query: str, limit: int = 50, search_type: str = "search") -> List[Dict[str, Any]]:
-        """Search for subreddits with different strategies based on search type"""
+    def find_subreddits(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Search for subreddits by niche and return sorted by subscribers"""
         try:
             subreddits = []
-            
-            if search_type == "niche":
-                # For niche: Focus on smaller, more targeted communities
-                for sub in self.reddit.subreddits.search(query, limit=limit*2):
-                    try:
-                        # Filter for smaller, more engaged communities
-                        if sub.subscribers and 1000 <= sub.subscribers <= 500000:
-                            subreddits.append({
-                                'name': sub.display_name,
-                                'subscribers': sub.subscribers or 0,
-                                'description': sub.public_description[:100] if sub.public_description else "",
-                                'type': 'niche'
-                            })
-                        time.sleep(0.1)
-                    except Exception as e:
-                        continue
-                
-                # Sort by engagement potential (smaller but active communities)
-                subreddits.sort(key=lambda x: x['subscribers'], reverse=False)
-                
-            else:
-                # For search: Focus on popular, established communities
-                for sub in self.reddit.subreddits.search(query, limit=limit):
-                    try:
-                        subreddits.append({
-                            'name': sub.display_name,
-                            'subscribers': sub.subscribers or 0,
-                            'description': sub.public_description[:100] if sub.public_description else "",
-                            'type': 'popular'
-                        })
-                        time.sleep(0.1)
-                    except Exception as e:
-                        continue
-                
-                # Sort by popularity (largest communities first)
-                subreddits.sort(key=lambda x: x['subscribers'], reverse=True)
-            
-            return subreddits[:limit]
-            
-        except Exception as e:
-            logging.error(f"Error searching subreddits: {e}")
-            return []
-
-    def get_random_subreddits(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get randomized subreddit results"""
-        try:
-            # Get more results than needed
-            all_subreddits = []
-            for sub in self.reddit.subreddits.search(query, limit=limit*3):
+            for sub in self.reddit.subreddits.search(query, limit=limit):
                 try:
-                    all_subreddits.append({
+                    subreddits.append({
                         'name': sub.display_name,
                         'subscribers': sub.subscribers or 0,
                         'description': sub.public_description[:100] if sub.public_description else ""
                     })
-                    time.sleep(0.1)
+                    time.sleep(0.1)  # Rate limiting
                 except Exception as e:
+                    logging.warning(f"Error getting subreddit info for {sub.display_name}: {e}")
                     continue
             
-            # Randomize and return subset
-            random.shuffle(all_subreddits)
-            return all_subreddits[:limit]
+            # Sort by subscribers (descending) - best ones first
+            subreddits.sort(key=lambda x: x['subscribers'], reverse=True)
+            return subreddits
             
         except Exception as e:
-            logging.error(f"Error getting random subreddits: {e}")
+            logging.error(f"Error searching subreddits: {e}")
             return []
 
     def parse_compare_input(self, input_text: str) -> List[str]:
@@ -199,7 +151,7 @@ def analyze_endpoint():
     """Endpoint to analyze a single subreddit"""
     data = request.json
     subreddit = data.get('subreddit')
-    days = data.get('days', 7)
+    days = data.get('days', 7)  # Reduced default days
     
     if not subreddit:
         return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
@@ -225,7 +177,7 @@ def analyze_multiple_endpoint():
     
     results = []
     for i, sub in enumerate(subreddits):
-        if i > 0:
+        if i > 0:  # Rate limiting between requests
             time.sleep(2)
         
         result = analyzer.analyze_subreddit(sub, days)
@@ -243,50 +195,45 @@ def analyze_multiple_endpoint():
 
 @app.route('/search', methods=['POST'])
 def search_endpoint():
-    """Search for popular subreddits - returns biggest ones first"""
+    """Search for subreddits by niche - returns best ones first"""
     data = request.json
     query = data.get('query')
-    limit = min(data.get('limit', 50), 100)
-    randomize = data.get('randomize', False)
+    limit = min(data.get('limit', 50), 100)  # Cap at 100 to avoid timeouts
     
     if not query:
         return jsonify({'success': False, 'error': 'No search query provided'}), 400
     
-    if randomize:
-        subreddits_data = analyzer.get_random_subreddits(query, limit)
-    else:
-        subreddits_data = analyzer.find_subreddits(query, limit, "search")
+    subreddits = analyzer.find_subreddits(query, limit)
     
-    # Return just the names for compatibility
-    subreddit_names = [sub['name'] for sub in subreddits_data]
+    # Return just the names for compatibility, but sorted by quality
+    subreddit_names = [sub['name'] for sub in subreddits]
     
     return jsonify({
         'success': True,
         'query': query,
         'count': len(subreddit_names),
-        'subreddits': subreddit_names,
-        'type': 'randomized' if randomize else 'popular'
+        'subreddits': subreddit_names
     })
 
 @app.route('/search-and-analyze', methods=['POST'])
 def search_and_analyze_endpoint():
-    """Niche analysis - focuses on smaller, more targeted communities"""
+    """Search for subreddits and analyze them - optimized version"""
     data = request.json
     query = data.get('query')
-    limit = min(data.get('limit', 20), 20)
+    limit = min(data.get('limit', 20), 20)  # Reduced limit to prevent timeouts
     days = data.get('days', 7)
     
     if not query:
         return jsonify({'success': False, 'error': 'No search query provided'}), 400
     
-    # Use niche search strategy
-    subreddits_data = analyzer.find_subreddits(query, limit*2, "niche")
+    # Search for subreddits
+    subreddits_data = analyzer.find_subreddits(query, limit)
     
-    # Analyze top niche subreddits
+    # Analyze top subreddits (by subscribers)
     results = []
-    for i, sub_data in enumerate(subreddits_data[:10]):
+    for i, sub_data in enumerate(subreddits_data[:10]):  # Analyze only top 10
         if i > 0:
-            time.sleep(2)
+            time.sleep(2)  # Rate limiting
             
         result = analyzer.analyze_subreddit(sub_data['name'], days)
         if result['success']:
@@ -299,8 +246,7 @@ def search_and_analyze_endpoint():
         'success': True,
         'query': query,
         'count': len(results),
-        'results': results,
-        'type': 'niche_analysis'
+        'results': results
     })
 
 # Health check endpoints
