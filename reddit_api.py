@@ -198,10 +198,12 @@ def search_and_analyze_endpoint():
     # Analyze each one
     results = []
     for sub in subreddits:
-        time.sleep(1)  # Rate limiting
         result = analyzer.analyze_subreddit(sub, days)
         if result['success']:
-            results.append(result)
+        results.append(result)
+        time.sleep(0.2)
+
+
     
     # Sort by effectiveness
     results.sort(key=lambda x: x.get('effectiveness_score', 0), reverse=True)
