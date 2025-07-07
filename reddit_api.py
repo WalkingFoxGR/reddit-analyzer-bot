@@ -195,13 +195,11 @@ def search_and_analyze_endpoint():
     # Search for subreddits
     subreddits = analyzer.find_subreddits(query, limit)
     
-    # Analyze each one
-    results = []
-    for sub in subreddits:
-        result = analyzer.analyze_subreddit(sub, days)
-        if result['success']:
+for sub in subreddits:
+    result = analyzer.analyze_subreddit(sub, days)
+    if result['success']:
         results.append(result)
-        time.sleep(0.2)
+    time.sleep(0.2)
 
 
     
