@@ -244,58 +244,64 @@ def analyze_multiple_endpoint():
 
 @app.route('/search', methods=['POST'])
 def search_endpoint():
-    """Search for subreddits by niche - returns best ones first"""
+    """Search for popular subreddits - returns biggest ones first"""
     data = request.json
     query = data.get('query')
-    limit = min(data.get('limit', 50), 100)  # Cap at 100 to avoid timeouts
+    limit = min(data.get('limit', 50), 100)
+    randomize = data.get('randomize', False)
     
     if not query:
         return jsonify({'success': False, 'error': 'No search query provided'}), 400
     
-    subreddits = analyzer.find_subreddits(query, limit)
+    if randomize:
+        subreddits_data = analyzer.get_random_subreddits(query, limit)
+    else:
+        subreddits_data = analyzer.find_subreddits(query, limit, "search")
     
-    # Return just the names for compatibility, but sorted by quality
-    subreddit_names = [sub['name'] for sub in subreddits]
+    # Return just the names for compatibility
+    subreddit_names = [sub['name'] for sub in subreddits_data]
     
     return jsonify({
         'success': True,
         'query': query,
         'count': len(subreddit_names),
-        'subreddits': subreddit_names
+        'subreddits': subreddit_names,
+        'type': 'randomized' if randomize else 'popular'
     })
 
 @app.route('/search-and-analyze', methods=['POST'])
 def search_and_analyze_endpoint():
-    """Search for subreddits and analyze them - optimized version"""
+    """Niche analysis - focuses on smaller, more targeted communities"""
     data = request.json
     query = data.get('query')
-    limit = min(data.get('limit', 20), 20)  # Reduced limit to prevent timeouts
+    limit = min(data.get('limit', 20), 20)
     days = data.get('days', 7)
     
     if not query:
         return jsonify({'success': False, 'error': 'No search query provided'}), 400
     
-    # Search for subreddits
-    subreddits_data = analyzer.find_subreddits(query, limit)
+    # Use niche search strategy
+    subreddits_data = analyzer.find_subreddits(query, limit*2, "niche")
     
-    # Analyze top subreddits (by subscribers)
+    # Analyze top niche subreddits
     results = []
-    for i, sub_data in enumerate(subreddits_data[:10]):  # Analyze only top 10
+    for i, sub_data in enumerate(subreddits_data[:10]):
         if i > 0:
-            time.sleep(2)  # Rate limiting
+            time.sleep(2)
             
         result = analyzer.analyze_subreddit(sub_data['name'], days)
         if result['success']:
             results.append(result)
     
-    # Sort by effectiveness
+    # Sort by effectiveness (better for niche targeting)
     results.sort(key=lambda x: x.get('effectiveness_score', 0), reverse=True)
     
     return jsonify({
         'success': True,
         'query': query,
         'count': len(results),
-        'results': results
+        'results': results,
+        'type': 'niche_analysis'
     })
 
 # Health check endpoints
