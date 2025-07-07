@@ -236,10 +236,18 @@ def format_for_telegram(query: str, results: List[Dict]) -> str:
     
     return message
 
+
+# Add this to your Flask app to keep it warm
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for monitoring"""
     return jsonify({'status': 'healthy', 'service': 'reddit-analyzer'})
+
+# Add this to prevent timeouts
+@app.route('/ping', methods=['GET'])
+def ping():
+    """Simple ping endpoint to keep service warm"""
+    return jsonify({'message': 'pong', 'timestamp': datetime.utcnow().isoformat()})
 
 if __name__ == '__main__':
     # Run on port 5000 for local development
