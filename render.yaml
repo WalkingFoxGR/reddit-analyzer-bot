@@ -9,7 +9,7 @@ services:
                --worker-class gthread
                --threads 4
                --workers 1
-               --timeout 180        # <-- 3 min instead of 30 s
+               --timeout 180
     envVars:
       - key: GUNICORN_CMD_ARGS
         value: "--log-level info"
