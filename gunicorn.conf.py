@@ -13,7 +13,7 @@ threads = 4
 worker_connections = 1000
 
 # Timeout settings - THIS IS THE KEY FIX
-timeout = 300  # 5 minutes (vs 30 second default)
+timeout = 600  # 5 minutes (vs 30 second default)
 keepalive = 300
 graceful_timeout = 30
 
