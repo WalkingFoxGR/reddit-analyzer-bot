@@ -1,14 +1,16 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import praw
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Tuple
 import logging
 import time
 import re
-from collections import defaultdict
-import requests
+from collections import defaultdict, Counter
+import threading
+import queue
+import pytz
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -27,42 +29,16 @@ class RedditAnalyzer:
             ratelimit_seconds=300
         )
         
-        # Blacklist of generic subreddits to filter out
+        # Cache for analysis results
+        self.analysis_cache = {}
+        self.cache_timeout = 3600  # 1 hour
+        
+        # Blacklist of generic subreddits
         self.generic_subreddits = {
             'funny', 'pics', 'gifs', 'videos', 'askreddit', 'todayilearned',
             'worldnews', 'news', 'aww', 'gaming', 'movies', 'music',
             'television', 'books', 'art', 'food', 'jokes', 'tifu',
-            'showerthoughts', 'iama', 'all', 'popular', 'random',
-            'teenagers', 'askouija', 'polandball', 'askfrance', 'egg_irl'
-        }
-        
-        # Category mappings for better search results
-        self.category_keywords = {
-            'technology': ['technology', 'tech', 'gadgets', 'programming', 'coding', 'software'],
-            'finance': ['finance', 'investing', 'stocks', 'crypto', 'money', 'trading'],
-            'fitness': ['fitness', 'gym', 'workout', 'exercise', 'health', 'nutrition'],
-            'gaming': ['gaming', 'games', 'pcgaming', 'console', 'esports'],
-            'fashion': ['fashion', 'style', 'clothing', 'streetwear', 'sneakers'],
-            'food': ['food', 'cooking', 'recipes', 'foodporn', 'baking'],
-            'cars': ['cars', 'autos', 'vehicles', 'racing', 'motorcycles'],
-            'sports': ['sports', 'football', 'basketball', 'soccer', 'baseball'],
-            'music': ['music', 'hiphop', 'rock', 'electronic', 'jazz', 'metal'],
-            'art': ['art', 'drawing', 'painting', 'digital', 'illustration'],
-            'science': ['science', 'physics', 'chemistry', 'biology', 'space'],
-            'travel': ['travel', 'backpacking', 'solo', 'destinations', 'tourism'],
-            'photography': ['photography', 'photos', 'cameras', 'photocritique'],
-            'movies': ['movies', 'films', 'cinema', 'moviesuggestions'],
-            'books': ['books', 'reading', 'literature', 'booksuggestions'],
-            'anime': ['anime', 'manga', 'animemes', 'animesuggest'],
-            'politics': ['politics', 'political', 'news', 'worldpolitics'],
-            'business': ['business', 'entrepreneur', 'startup', 'smallbusiness'],
-            'education': ['education', 'learning', 'study', 'college', 'university'],
-            'relationships': ['relationships', 'dating', 'advice', 'love'],
-            'pets': ['pets', 'dogs', 'cats', 'animals', 'aww'],
-            'diy': ['diy', 'crafts', 'woodworking', 'makers', 'howto'],
-            'beauty': ['beauty', 'makeup', 'skincare', 'hair', 'cosmetics'],
-            'parenting': ['parenting', 'parents', 'mommit', 'daddit', 'babies'],
-            'mental_health': ['mentalhealth', 'anxiety', 'depression', 'therapy', 'wellness']
+            'showerthoughts', 'iama', 'all', 'popular', 'random'
         }
     
     def calculate_effectiveness(self, avg_posts_per_day: float, avg_score_per_post: float,
@@ -100,182 +76,291 @@ class RedditAnalyzer:
         
         return min(100, max(0, effectiveness))
     
-    def detect_category(self, query: str) -> List[str]:
-        """Detect if query matches any known categories"""
-        query_lower = query.lower()
-        matched_categories = []
-        
-        for category, keywords in self.category_keywords.items():
-            for keyword in keywords:
-                if keyword in query_lower or query_lower in keyword:
-                    matched_categories.append(category)
-                    break
-        
-        return matched_categories
-    
-    def get_top_subreddits_by_category(self, categories: List[str], limit: int = 50) -> List[Dict[str, Any]]:
-        """Get top subreddits for specific categories"""
-        subreddits = {}
-        
-        # Predefined top subreddits for common categories
-        category_subs = {
-            'technology': ['technology', 'gadgets', 'tech', 'futurology', 'android', 'apple', 'hardware'],
-            'finance': ['personalfinance', 'investing', 'stocks', 'cryptocurrency', 'wallstreetbets', 'financialindependence'],
-            'fitness': ['fitness', 'gym', 'bodybuilding', 'running', 'weightlifting', 'yoga', 'crossfit'],
-            'gaming': ['gaming', 'pcgaming', 'ps5', 'xbox', 'nintendoswitch', 'steam', 'gamingsuggestions'],
-            'crypto': ['cryptocurrency', 'bitcoin', 'ethereum', 'cryptomarkets', 'altcoin', 'defi', 'cryptomoonshots'],
-            'programming': ['programming', 'learnprogramming', 'webdev', 'javascript', 'python', 'coding'],
-            'fashion': ['malefashionadvice', 'femalefashionadvice', 'streetwear', 'sneakers', 'fashionreps'],
-            'cars': ['cars', 'autos', 'carporn', 'projectcar', 'whatcarshouldibuy', 'mechanicadvice'],
-            'photography': ['photography', 'photocritique', 'itookapicture', 'cameras', 'analogcommunity'],
-            'anime': ['anime', 'animemes', 'animesuggest', 'manga', 'animeirl', 'wholesomeanimemes'],
-            'food': ['food', 'cooking', 'recipes', 'foodporn', 'mealprepsunday', 'baking', 'eatcheapandhealthy']
-        }
-        
-        for category in categories:
-            if category in category_subs:
-                for sub_name in category_subs[category]:
-                    try:
-                        sub = self.reddit.subreddit(sub_name)
-                        subreddits[sub_name] = {
-                            'name': sub.display_name,
-                            'subscribers': sub.subscribers or 0,
-                            'relevance': 100,  # High relevance for curated lists
-                            'description': sub.public_description[:100] if sub.public_description else ""
-                        }
-                    except:
-                        continue
-        
-        return list(subreddits.values())
-    
-    def smart_search_subreddits(self, query: str, limit: int = 50, mode: str = 'search') -> List[Dict[str, Any]]:
-        """Smart search that finds truly related subreddits"""
+    def analyze_posting_times(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
+        """Analyze best posting times for a subreddit"""
         try:
-            all_subreddits = {}
-            query_lower = query.lower()
+            subreddit = self.reddit.subreddit(subreddit_name)
             
-            # First, check if this matches any known categories
-            categories = self.detect_category(query)
-            if categories:
-                category_subs = self.get_top_subreddits_by_category(categories, limit)
-                for sub in category_subs:
-                    all_subreddits[sub['name']] = sub
+            # Data structures for time analysis
+            hourly_scores = defaultdict(list)
+            hourly_comments = defaultdict(list)
+            hourly_posts = defaultdict(int)
+            daily_scores = defaultdict(list)
+            daily_comments = defaultdict(list)
             
-            # Clean up the query for better search
-            # Remove common words that lead to bad results
-            stop_words = {'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for'}
-            query_terms = [term for term in query_lower.split() if term not in stop_words]
-            clean_query = ' '.join(query_terms)
+            # Analyze posts from the past week
+            date_threshold = datetime.utcnow() - timedelta(days=days)
+            posts_analyzed = 0
             
-            # Method 1: Search for exact subreddit names first
-            exact_searches = [
-                query,
-                query.replace(' ', ''),  # nospace
-                query.replace(' ', '_'),  # underscore
-                clean_query,
-                clean_query.replace(' ', '')
-            ]
-            
-            for search_term in exact_searches:
+            for post in subreddit.top(time_filter='week', limit=500):
                 try:
-                    # Try to get subreddit directly
-                    sub = self.reddit.subreddit(search_term)
-                    if sub.subscribers and sub.subscribers > 100:  # Must have some subscribers
-                        all_subreddits[sub.display_name] = {
-                            'name': sub.display_name,
-                            'subscribers': sub.subscribers,
-                            'relevance': 100,
-                            'description': sub.public_description[:100] if sub.public_description else ""
-                        }
-                except:
-                    pass
-            
-            # Method 2: Reddit search with strict filtering
-            search_limit = min(limit * 3, 300)  # Search more to filter down
-            
-            for sub in self.reddit.subreddits.search(clean_query, limit=search_limit):
-                try:
-                    sub_name_lower = sub.display_name.lower()
-                    
-                    # Skip if already found or generic
-                    if sub.display_name in all_subreddits or sub_name_lower in self.generic_subreddits:
+                    post_time = datetime.utcfromtimestamp(post.created_utc)
+                    if post_time < date_threshold:
                         continue
                     
-                    # Skip if subscriber count is too low
-                    if not sub.subscribers or sub.subscribers < 1000:
-                        continue
+                    # Convert to EST (most Reddit users are US-based)
+                    est = pytz.timezone('US/Eastern')
+                    post_time_est = pytz.utc.localize(post_time).astimezone(est)
                     
-                    # Calculate relevance more strictly
-                    relevance_score = 0
-                    name_matches = 0
+                    hour = post_time_est.hour
+                    day = post_time_est.strftime('%A')
                     
-                    for term in query_terms:
-                        if len(term) > 2:  # Skip very short terms
-                            # Exact word match in name (not just substring)
-                            if term in sub_name_lower.split('_') or term in re.split(r'(?=[A-Z])', sub.display_name):
-                                relevance_score += 20
-                                name_matches += 1
-                            # Substring match in name
-                            elif term in sub_name_lower:
-                                relevance_score += 10
-                                name_matches += 1
-                            # Match in title (first few words matter more)
-                            title_words = (sub.title or '').lower().split()[:10]
-                            if term in title_words:
-                                relevance_score += 5 - title_words.index(term) * 0.5
+                    # Record metrics
+                    hourly_scores[hour].append(post.score)
+                    hourly_comments[hour].append(post.num_comments)
+                    hourly_posts[hour] += 1
                     
-                    # Require at least partial name match for most queries
-                    if name_matches > 0 or relevance_score >= 15:
-                        all_subreddits[sub.display_name] = {
-                            'name': sub.display_name,
-                            'subscribers': sub.subscribers,
-                            'relevance': relevance_score,
-                            'description': sub.public_description[:100] if sub.public_description else ""
-                        }
+                    daily_scores[day].append(post.score)
+                    daily_comments[day].append(post.num_comments)
                     
+                    posts_analyzed += 1
+                    
+                    if posts_analyzed % 50 == 0:
+                        time.sleep(0.5)  # Rate limiting
+                        
                 except Exception as e:
-                    logging.warning(f"Error processing subreddit: {e}")
+                    logging.warning(f"Error analyzing post: {e}")
                     continue
             
-            # Convert to list
-            results = list(all_subreddits.values())
+            # Calculate averages and find best times
+            best_times = []
             
-            # Remove duplicates and sort
-            seen = set()
-            unique_results = []
-            for r in results:
-                if r['name'] not in seen:
-                    seen.add(r['name'])
-                    unique_results.append(r)
-            
-            if mode == 'search':
-                # For /search: Sort by subscribers (largest first)
-                unique_results.sort(key=lambda x: x['subscribers'], reverse=True)
-            else:  # mode == 'niche'
-                # For /niche: Find sweet spot - active but not too large
-                for sub in unique_results:
-                    subs = sub['subscribers']
-                    if subs < 10000:
-                        sub['niche_score'] = subs / 10000 * 50
-                    elif subs < 100000:
-                        sub['niche_score'] = 90
-                    elif subs < 500000:
-                        sub['niche_score'] = 80
-                    else:
-                        sub['niche_score'] = 60 - min((subs - 500000) / 1500000 * 40, 40)
+            for hour in range(24):
+                if hour in hourly_scores and hourly_scores[hour]:
+                    avg_score = sum(hourly_scores[hour]) / len(hourly_scores[hour])
+                    avg_comments = sum(hourly_comments[hour]) / len(hourly_comments[hour])
+                    post_count = hourly_posts[hour]
                     
-                    sub['niche_score'] += sub.get('relevance', 0) * 0.5
-                
-                unique_results.sort(key=lambda x: x.get('niche_score', 0), reverse=True)
+                    # Combined engagement score
+                    engagement = (avg_score * 0.6 + avg_comments * 10 * 0.4)
+                    
+                    best_times.append({
+                        'hour': hour,
+                        'avg_score': round(avg_score, 1),
+                        'avg_comments': round(avg_comments, 1),
+                        'engagement': round(engagement, 1),
+                        'post_count': post_count,
+                        'competition': 'Low' if post_count < 10 else 'Medium' if post_count < 20 else 'High'
+                    })
             
-            return unique_results[:limit]
+            # Sort by engagement
+            best_times.sort(key=lambda x: x['engagement'], reverse=True)
+            
+            # Calculate best days
+            best_days = []
+            day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            
+            for day in day_order:
+                if day in daily_scores and daily_scores[day]:
+                    avg_score = sum(daily_scores[day]) / len(daily_scores[day])
+                    avg_comments = sum(daily_comments[day]) / len(daily_comments[day])
+                    
+                    best_days.append({
+                        'day': day,
+                        'avg_score': round(avg_score, 1),
+                        'avg_comments': round(avg_comments, 1),
+                        'post_count': len(daily_scores[day])
+                    })
+            
+            # Sort days by average score
+            best_days.sort(key=lambda x: x['avg_score'], reverse=True)
+            
+            return {
+                'best_hours': best_times[:10],  # Top 10 hours
+                'best_days': best_days,
+                'timezone': 'EST',
+                'posts_analyzed': posts_analyzed
+            }
             
         except Exception as e:
-            logging.error(f"Error in smart search: {e}")
-            return []
+            logging.error(f"Error analyzing posting times: {e}")
+            return {
+                'best_hours': [],
+                'best_days': [],
+                'error': str(e)
+            }
     
-    def analyze_subreddit(self, subreddit_name: str, days: int = 30) -> Dict[str, Any]:
-        """Analyze a single subreddit with better error handling"""
+    def find_related_subreddits_progressive(self, seed_subreddit: str, max_users: int = 100,
+                                          progress_callback=None) -> Dict[str, Any]:
+        """Progressive analysis of related subreddits with real-time updates"""
+        try:
+            related_subs = defaultdict(int)
+            user_subreddits = defaultdict(set)
+            users_analyzed = set()
+            
+            # Get the seed subreddit
+            try:
+                subreddit = self.reddit.subreddit(seed_subreddit)
+                seed_info = {
+                    'name': subreddit.display_name,
+                    'subscribers': subreddit.subscribers
+                }
+            except:
+                return {
+                    'status': 'error',
+                    'error': f"Subreddit '{seed_subreddit}' not found"
+                }
+            
+            # Progress tracking
+            total_users = 0
+            users_to_analyze = []
+            
+            # Collect users from top posts
+            for post in subreddit.hot(limit=25):
+                try:
+                    # Add author
+                    if post.author and post.author.name not in users_analyzed:
+                        users_to_analyze.append(('author', post.author.name, post.score))
+                    
+                    # Add top commenters
+                    post.comments.replace_more(limit=0)
+                    for comment in post.comments[:5]:
+                        if comment.author and comment.author.name not in users_analyzed:
+                            users_to_analyze.append(('commenter', comment.author.name, comment.score))
+                    
+                except:
+                    continue
+            
+            # Sort by score (prioritize high-karma users)
+            users_to_analyze.sort(key=lambda x: x[2], reverse=True)
+            total_users = min(len(users_to_analyze), max_users)
+            
+            # Analyze users progressively
+            for i, (user_type, username, score) in enumerate(users_to_analyze[:total_users]):
+                if username in users_analyzed:
+                    continue
+                    
+                users_analyzed.add(username)
+                
+                try:
+                    user = self.reddit.redditor(username)
+                    
+                    # Analyze user's recent activity
+                    user_subs = set()
+                    
+                    # Check recent submissions
+                    for submission in user.submissions.new(limit=50):
+                        sub_name = submission.subreddit.display_name
+                        if sub_name.lower() != seed_subreddit.lower() and sub_name.lower() not in self.generic_subreddits:
+                            user_subs.add(sub_name)
+                            related_subs[sub_name] += 2  # Weight submissions higher
+                    
+                    # Check recent comments
+                    for comment in user.comments.new(limit=100):
+                        sub_name = comment.subreddit.display_name
+                        if sub_name.lower() != seed_subreddit.lower() and sub_name.lower() not in self.generic_subreddits:
+                            user_subs.add(sub_name)
+                            related_subs[sub_name] += 1
+                    
+                    user_subreddits[username] = user_subs
+                    
+                    # Progress update
+                    if progress_callback and (i + 1) % 5 == 0:
+                        progress_callback({
+                            'analyzed_users': i + 1,
+                            'total_users': total_users,
+                            'found_subreddits': len(related_subs)
+                        })
+                    
+                    # Rate limiting
+                    time.sleep(0.2)
+                    
+                except Exception as e:
+                    logging.warning(f"Error analyzing user {username}: {e}")
+                    continue
+            
+            # Get detailed info for top related subreddits
+            sorted_subs = sorted(related_subs.items(), key=lambda x: x[1], reverse=True)[:50]
+            
+            detailed_results = []
+            for sub_name, overlap_score in sorted_subs:
+                try:
+                    sub = self.reddit.subreddit(sub_name)
+                    
+                    # Calculate user overlap percentage
+                    users_in_both = sum(1 for user_subs in user_subreddits.values() if sub_name in user_subs)
+                    overlap_percentage = (users_in_both / len(users_analyzed)) * 100 if users_analyzed else 0
+                    
+                    detailed_results.append({
+                        'name': sub.display_name,
+                        'subscribers': sub.subscribers or 0,
+                        'description': sub.public_description[:200] if sub.public_description else "",
+                        'overlap_score': overlap_score,
+                        'overlap_percentage': round(overlap_percentage, 1),
+                        'users_in_both': users_in_both,
+                        'nsfw': sub.over18
+                    })
+                except:
+                    continue
+            
+            return {
+                'status': 'complete',
+                'seed_subreddit': seed_info,
+                'analyzed_users': len(users_analyzed),
+                'total_users': total_users,
+                'related_subreddits': detailed_results,
+                'analysis_depth': 'deep' if len(users_analyzed) > 50 else 'moderate'
+            }
+            
+        except Exception as e:
+            logging.error(f"Error in progressive analysis: {e}")
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+    
+    def analyze_subreddit_with_timing(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
+        """Enhanced subreddit analysis including best posting times"""
+        try:
+            # Get basic analysis
+            basic_analysis = self.analyze_subreddit(subreddit_name, days)
+            
+            if not basic_analysis['success']:
+                return basic_analysis
+            
+            # Add timing analysis
+            timing_analysis = self.analyze_posting_times(subreddit_name, days)
+            
+            # Combine results
+            basic_analysis['posting_times'] = timing_analysis
+            
+            # Format best times message
+            if timing_analysis['best_hours']:
+                best_times_msg = "\n\n📅 **Best Posting Times (EST):**\n"
+                
+                # Top 3 hours
+                for i, hour_data in enumerate(timing_analysis['best_hours'][:3]):
+                    hour = hour_data['hour']
+                    hour_12 = datetime.strptime(str(hour), '%H').strftime('%I %p').lstrip('0')
+                    
+                    if hour_data['avg_score'] > hour_data['avg_comments'] * 10:
+                        icon = "📈"  # High upvotes
+                        focus = f"High upvotes (avg {hour_data['avg_score']})"
+                    elif hour_data['avg_comments'] > 20:
+                        icon = "💬"  # High comments
+                        focus = f"High comments (avg {hour_data['avg_comments']})"
+                    else:
+                        icon = "🏆"  # Balanced
+                        focus = "Best overall engagement"
+                    
+                    best_times_msg += f"{icon} **{hour_12}**: {focus}\n"
+                
+                # Best days
+                if timing_analysis['best_days']:
+                    best_times_msg += "\n📊 **Best Days:**\n"
+                    top_days = timing_analysis['best_days'][:3]
+                    best_times_msg += ", ".join([f"**{d['day']}**" for d in top_days])
+                
+                basic_analysis['timing_summary'] = best_times_msg
+            
+            return basic_analysis
+            
+        except Exception as e:
+            logging.error(f"Error in enhanced analysis: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def analyze_subreddit(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
+        """Basic subreddit analysis"""
         try:
             subreddit = self.reddit.subreddit(subreddit_name)
             subscribers = subreddit.subscribers
@@ -285,8 +370,7 @@ class RedditAnalyzer:
             total_score = 0
             total_comments = 0
             
-            # Reduced limit to avoid timeouts
-            for post in subreddit.new(limit=500):
+            for post in subreddit.new(limit=300):
                 post_date = datetime.utcfromtimestamp(post.created_utc)
                 if post_date < date_threshold:
                     break
@@ -295,9 +379,8 @@ class RedditAnalyzer:
                 total_score += post.score
                 total_comments += post.num_comments
                 
-                # Add small delay to respect rate limits
                 if post_count % 50 == 0:
-                    time.sleep(1)
+                    time.sleep(0.5)
             
             avg_posts_per_day = post_count / days
             avg_score_per_post = total_score / post_count if post_count > 0 else 0
@@ -315,7 +398,8 @@ class RedditAnalyzer:
                 'avg_posts_per_day': round(avg_posts_per_day, 2),
                 'avg_score_per_post': round(avg_score_per_post, 2),
                 'avg_comments_per_post': round(avg_comments_per_post, 2),
-                'effectiveness_score': round(effectiveness, 2)
+                'effectiveness_score': round(effectiveness, 2),
+                'days_analyzed': days
             }
         except Exception as e:
             logging.error(f"Error analyzing subreddit {subreddit_name}: {e}")
@@ -323,40 +407,36 @@ class RedditAnalyzer:
     
     def parse_compare_input(self, input_text: str) -> List[str]:
         """Parse flexible compare input formats"""
-        # Remove extra spaces and split by various delimiters
         cleaned = re.sub(r'\s+', ' ', input_text.strip())
-        
-        # Split by comma, space, or other common delimiters
         subreddits = re.split(r'[,\s]+', cleaned)
-        
-        # Clean up each subreddit name
         return [sub.strip() for sub in subreddits if sub.strip()]
 
 # Initialize analyzer
 analyzer = RedditAnalyzer()
 
-# API Endpoints
+# Store for progressive analysis sessions
+analysis_sessions = {}
+
 @app.route('/analyze', methods=['POST'])
 def analyze_endpoint():
-    """Endpoint to analyze a single subreddit"""
+    """Enhanced analyze endpoint with posting times"""
     data = request.json
     subreddit = data.get('subreddit')
-    days = data.get('days', 7)  # Reduced default days
+    days = data.get('days', 7)
     
     if not subreddit:
         return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
     
-    result = analyzer.analyze_subreddit(subreddit, days)
+    result = analyzer.analyze_subreddit_with_timing(subreddit, days)
     return jsonify(result)
 
 @app.route('/analyze-multiple', methods=['POST'])
 def analyze_multiple_endpoint():
-    """Endpoint to analyze multiple subreddits"""
+    """Enhanced compare endpoint with posting times"""
     data = request.json
     subreddits_input = data.get('subreddits', [])
     days = data.get('days', 7)
     
-    # Handle flexible input format
     if isinstance(subreddits_input, str):
         subreddits = analyzer.parse_compare_input(subreddits_input)
     else:
@@ -367,14 +447,13 @@ def analyze_multiple_endpoint():
     
     results = []
     for i, sub in enumerate(subreddits):
-        if i > 0:  # Rate limiting between requests
+        if i > 0:
             time.sleep(2)
         
-        result = analyzer.analyze_subreddit(sub, days)
+        result = analyzer.analyze_subreddit_with_timing(sub, days)
         if result['success']:
             results.append(result)
     
-    # Sort by effectiveness
     results.sort(key=lambda x: x.get('effectiveness_score', 0), reverse=True)
     
     return jsonify({
@@ -385,7 +464,7 @@ def analyze_multiple_endpoint():
 
 @app.route('/search', methods=['POST'])
 def search_endpoint():
-    """Search for largest related subreddits"""
+    """Search using user overlap analysis"""
     data = request.json
     query = data.get('query')
     limit = min(data.get('limit', 30), 50)
@@ -393,63 +472,171 @@ def search_endpoint():
     if not query:
         return jsonify({'success': False, 'error': 'No search query provided'}), 400
     
-    # Use smart search in 'search' mode (finds largest communities)
-    subreddits = analyzer.smart_search_subreddits(query, limit, mode='search')
+    # First, try to find the main subreddit for this query
+    try:
+        # Try direct match
+        main_sub = None
+        for variation in [query, query.replace(' ', ''), query.replace(' ', '_')]:
+            try:
+                sub = analyzer.reddit.subreddit(variation)
+                if sub.subscribers and sub.subscribers > 1000:
+                    main_sub = sub.display_name
+                    break
+            except:
+                continue
+        
+        # If found, do user overlap analysis
+        if main_sub:
+            results = analyzer.find_related_subreddits_progressive(main_sub, max_users=50)
+            
+            if results['status'] == 'complete' and results['related_subreddits']:
+                # Return just names for compatibility, sorted by overlap
+                subreddit_names = [sub['name'] for sub in results['related_subreddits'][:limit]]
+                
+                return jsonify({
+                    'success': True,
+                    'query': query,
+                    'count': len(subreddit_names),
+                    'subreddits': subreddit_names,
+                    'analysis_method': 'user_overlap',
+                    'seed_subreddit': main_sub,
+                    'detailed': results['related_subreddits'][:limit]
+                })
+    except:
+        pass
     
-    # Return just the names for compatibility
-    subreddit_names = [sub['name'] for sub in subreddits]
-    
+    # Fallback to regular search if no main subreddit found
     return jsonify({
         'success': True,
         'query': query,
-        'count': len(subreddit_names),
-        'subreddits': subreddit_names,
-        'detailed': subreddits  # Also include detailed info
+        'count': 0,
+        'subreddits': [],
+        'message': f"No main subreddit found for '{query}'. Try a more specific term."
     })
 
 @app.route('/search-and-analyze', methods=['POST'])
 def search_and_analyze_endpoint():
-    """Search for niche subreddits and analyze them"""
+    """Progressive search and analysis for niche communities"""
     data = request.json
     query = data.get('query')
     limit = min(data.get('limit', 20), 30)
     days = data.get('days', 7)
+    session_id = data.get('session_id', str(time.time()))
     
     if not query:
         return jsonify({'success': False, 'error': 'No search query provided'}), 400
     
-    # Use smart search in 'niche' mode (finds engaged mid-size communities)
-    subreddits_data = analyzer.smart_search_subreddits(query, limit, mode='niche')
+    # Create or get session
+    if session_id not in analysis_sessions:
+        analysis_sessions[session_id] = {
+            'status': 'starting',
+            'results': [],
+            'analyzed': 0,
+            'total': 0
+        }
     
-    # Analyze top subreddits
-    results = []
-    for i, sub_data in enumerate(subreddits_data[:10]):  # Analyze top 10
-        if i > 0:
-            time.sleep(2)  # Rate limiting
+    def analyze_in_background():
+        # Find main subreddit
+        main_sub = None
+        for variation in [query, query.replace(' ', ''), query.replace(' ', '_')]:
+            try:
+                sub = analyzer.reddit.subreddit(variation)
+                if sub.subscribers and sub.subscribers > 1000:
+                    main_sub = sub.display_name
+                    break
+            except:
+                continue
+        
+        if not main_sub:
+            analysis_sessions[session_id]['status'] = 'error'
+            analysis_sessions[session_id]['error'] = 'No main subreddit found'
+            return
+        
+        # Progress callback
+        def update_progress(progress):
+            analysis_sessions[session_id].update({
+                'status': 'analyzing',
+                'analyzed': progress['analyzed_users'],
+                'total': progress['total_users'],
+                'found': progress['found_subreddits']
+            })
+        
+        # Find related subreddits
+        related = analyzer.find_related_subreddits_progressive(
+            main_sub, 
+            max_users=100,
+            progress_callback=update_progress
+        )
+        
+        if related['status'] == 'complete':
+            # Analyze top subreddits
+            results = []
+            for i, sub_data in enumerate(related['related_subreddits'][:10]):
+                if i > 0:
+                    time.sleep(2)
+                
+                analysis = analyzer.analyze_subreddit(sub_data['name'], days)
+                if analysis['success']:
+                    analysis['overlap_percentage'] = sub_data['overlap_percentage']
+                    analysis['users_in_common'] = sub_data['users_in_both']
+                    results.append(analysis)
+                
+                analysis_sessions[session_id]['analyzed_subreddits'] = i + 1
             
-        result = analyzer.analyze_subreddit(sub_data['name'], days)
-        if result['success']:
-            results.append(result)
+            results.sort(key=lambda x: x.get('effectiveness_score', 0), reverse=True)
+            
+            analysis_sessions[session_id].update({
+                'status': 'complete',
+                'results': results,
+                'seed_subreddit': main_sub,
+                'total_related': len(related['related_subreddits'])
+            })
+        else:
+            analysis_sessions[session_id]['status'] = 'error'
+            analysis_sessions[session_id]['error'] = related.get('error', 'Unknown error')
     
-    # Sort by effectiveness
-    results.sort(key=lambda x: x.get('effectiveness_score', 0), reverse=True)
+    # Start background analysis
+    if analysis_sessions[session_id]['status'] == 'starting':
+        thread = threading.Thread(target=analyze_in_background)
+        thread.start()
     
-    return jsonify({
-        'success': True,
-        'query': query,
-        'count': len(results),
-        'results': results
-    })
+    # Return current session state
+    session = analysis_sessions[session_id]
+    
+    # Clean up old sessions
+    if session['status'] == 'complete':
+        # Remove session after returning results
+        result = {
+            'success': True,
+            'query': query,
+            'status': session['status'],
+            'count': len(session.get('results', [])),
+            'results': session.get('results', []),
+            'seed_subreddit': session.get('seed_subreddit'),
+            'session_id': session_id
+        }
+        del analysis_sessions[session_id]
+        return jsonify(result)
+    else:
+        return jsonify({
+            'success': True,
+            'query': query,
+            'status': session['status'],
+            'analyzed_users': session.get('analyzed', 0),
+            'total_users': session.get('total', 0),
+            'found_subreddits': session.get('found', 0),
+            'analyzed_subreddits': session.get('analyzed_subreddits', 0),
+            'session_id': session_id,
+            'message': 'Analysis in progress. Poll this endpoint with the same session_id for updates.'
+        })
 
 # Health check endpoints
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint for monitoring"""
     return jsonify({'status': 'healthy', 'service': 'reddit-analyzer'})
 
 @app.route('/ping', methods=['GET'])
 def ping():
-    """Simple ping endpoint to keep service warm"""
     return jsonify({'message': 'pong', 'timestamp': datetime.utcnow().isoformat()})
 
 if __name__ == '__main__':
