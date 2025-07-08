@@ -14,7 +14,7 @@ worker_connections = 1000
 
 # Timeout settings - THIS IS THE KEY FIX
 timeout = 600  # 10 minutes (vs 30 second default)
-keepalive = 300
+keepalive = 600
 graceful_timeout = 30
 
 # Worker lifecycle
