@@ -515,8 +515,8 @@ def search_endpoint():
     })
 
 @app.route('/search-and-analyze', methods=['POST'])
-def search_and_analyze_endpoint():
-    """Progressive search and analysis for niche communities"""
+def search_and_analyze_endpoint_fixed():
+    """Fixed progressive search and analysis for niche communities"""
     data = request.json
     query = data.get('query')
     limit = min(data.get('limit', 20), 30)
@@ -526,109 +526,136 @@ def search_and_analyze_endpoint():
     if not query:
         return jsonify({'success': False, 'error': 'No search query provided'}), 400
     
-    # Create or get session
-    if session_id not in analysis_sessions:
-        analysis_sessions[session_id] = {
-            'status': 'starting',
-            'results': [],
-            'analyzed': 0,
-            'total': 0
-        }
+    # For immediate response, check if we have a cached result
+    cache_key = f"niche_{query}_{days}"
+    if cache_key in analyzer.analysis_cache:
+        cached_time, cached_result = analyzer.analysis_cache[cache_key]
+        if time.time() - cached_time < 3600:  # 1 hour cache
+            return jsonify(cached_result)
     
-    def analyze_in_background():
-        # Find main subreddit
-        main_sub = None
-        for variation in [query, query.replace(' ', ''), query.replace(' ', '_')]:
-            try:
-                sub = analyzer.reddit.subreddit(variation)
-                if sub.subscribers and sub.subscribers > 1000:
-                    main_sub = sub.display_name
-                    break
-            except:
-                continue
+    # Try to find main subreddit synchronously first
+    main_sub = None
+    for variation in [query, query.replace(' ', ''), query.replace(' ', '_')]:
+        try:
+            sub = analyzer.reddit.subreddit(variation)
+            # Check if subreddit exists and has reasonable size
+            if hasattr(sub, 'subscribers') and sub.subscribers and sub.subscribers > 100:
+                main_sub = sub.display_name
+                break
+        except Exception as e:
+            logging.debug(f"Variation {variation} failed: {e}")
+            continue
+    
+    if not main_sub:
+        # Try searching for related subreddits
+        try:
+            search_results = []
+            for submission in analyzer.reddit.subreddit('all').search(query, limit=10):
+                sub_name = submission.subreddit.display_name
+                if sub_name.lower() not in analyzer.generic_subreddits:
+                    search_results.append(sub_name)
+            
+            if search_results:
+                main_sub = search_results[0]
+            else:
+                return jsonify({
+                    'success': False,
+                    'status': 'error',
+                    'error': f'No subreddit found for "{query}". Try a more specific term.',
+                    'query': query
+                })
+        except:
+            return jsonify({
+                'success': False,
+                'status': 'error', 
+                'error': f'No subreddit found for "{query}". Try a more specific term.',
+                'query': query
+            })
+    
+    # Now do the actual analysis
+    try:
+        # Find related subreddits with user overlap
+        logging.info(f"Starting niche analysis for {main_sub}")
+        related = analyzer.find_related_subreddits_progressive(main_sub, max_users=50)
         
-        if not main_sub:
-            analysis_sessions[session_id]['status'] = 'error'
-            analysis_sessions[session_id]['error'] = 'No main subreddit found'
-            return
-        
-        # Progress callback
-        def update_progress(progress):
-            analysis_sessions[session_id].update({
-                'status': 'analyzing',
-                'analyzed': progress['analyzed_users'],
-                'total': progress['total_users'],
-                'found': progress['found_subreddits']
+        if related['status'] != 'complete':
+            return jsonify({
+                'success': False,
+                'status': 'error',
+                'error': related.get('error', 'Analysis failed'),
+                'query': query
             })
         
-        # Find related subreddits
-        related = analyzer.find_related_subreddits_progressive(
-            main_sub, 
-            max_users=100,
-            progress_callback=update_progress
-        )
+        # Analyze top related subreddits
+        results = []
+        subreddits_to_analyze = related['related_subreddits'][:10]
         
-        if related['status'] == 'complete':
-            # Analyze top subreddits
-            results = []
-            for i, sub_data in enumerate(related['related_subreddits'][:10]):
-                if i > 0:
-                    time.sleep(2)
-                
+        for i, sub_data in enumerate(subreddits_to_analyze):
+            if i > 0:
+                time.sleep(1)  # Rate limiting
+            
+            try:
                 analysis = analyzer.analyze_subreddit(sub_data['name'], days)
                 if analysis['success']:
+                    # Add overlap data
                     analysis['overlap_percentage'] = sub_data['overlap_percentage']
                     analysis['users_in_common'] = sub_data['users_in_both']
                     results.append(analysis)
-                
-                analysis_sessions[session_id]['analyzed_subreddits'] = i + 1
-            
-            results.sort(key=lambda x: x.get('effectiveness_score', 0), reverse=True)
-            
-            analysis_sessions[session_id].update({
-                'status': 'complete',
-                'results': results,
-                'seed_subreddit': main_sub,
-                'total_related': len(related['related_subreddits'])
-            })
-        else:
-            analysis_sessions[session_id]['status'] = 'error'
-            analysis_sessions[session_id]['error'] = related.get('error', 'Unknown error')
-    
-    # Start background analysis
-    if analysis_sessions[session_id]['status'] == 'starting':
-        thread = threading.Thread(target=analyze_in_background)
-        thread.start()
-    
-    # Return current session state
-    session = analysis_sessions[session_id]
-    
-    # Clean up old sessions
-    if session['status'] == 'complete':
-        # Remove session after returning results
+            except Exception as e:
+                logging.warning(f"Failed to analyze {sub_data['name']}: {e}")
+                continue
+        
+        # Sort by effectiveness
+        results.sort(key=lambda x: x.get('effectiveness_score', 0), reverse=True)
+        
+        # Cache the result
         result = {
             'success': True,
             'query': query,
-            'status': session['status'],
-            'count': len(session.get('results', [])),
-            'results': session.get('results', []),
-            'seed_subreddit': session.get('seed_subreddit'),
-            'session_id': session_id
+            'status': 'complete',
+            'count': len(results),
+            'results': results,
+            'seed_subreddit': main_sub,
+            'analyzed_users': related.get('analyzed_users', 0),
+            'total_users': related.get('total_users', 0)
         }
-        del analysis_sessions[session_id]
+        
+        analyzer.analysis_cache[cache_key] = (time.time(), result)
+        
         return jsonify(result)
-    else:
+        
+    except Exception as e:
+        logging.error(f"Error in niche analysis: {e}")
         return jsonify({
-            'success': True,
-            'query': query,
-            'status': session['status'],
-            'analyzed_users': session.get('analyzed', 0),
-            'total_users': session.get('total', 0),
-            'found_subreddits': session.get('found', 0),
-            'analyzed_subreddits': session.get('analyzed_subreddits', 0),
-            'session_id': session_id,
-            'message': 'Analysis in progress. Poll this endpoint with the same session_id for updates.'
+            'success': False,
+            'status': 'error',
+            'error': str(e),
+            'query': query
         })
+
+# Also add this helper method to clean up old cache entries periodically:
+def cleanup_cache():
+    """Remove expired cache entries"""
+    current_time = time.time()
+    expired_keys = []
+    
+    for key, (cached_time, _) in analyzer.analysis_cache.items():
+        if current_time - cached_time > 3600:  # 1 hour expiry
+            expired_keys.append(key)
+    
+    for key in expired_keys:
+        del analyzer.analysis_cache[key]
+
+# Add this route for health monitoring
+@app.route('/cache-status', methods=['GET'])
+def cache_status():
+    """Check cache status and memory usage"""
+    cleanup_cache()
+    return jsonify({
+        'cache_entries': len(analyzer.analysis_cache),
+        'cache_keys': list(analyzer.analysis_cache.keys()),
+        'timestamp': datetime.utcnow().isoformat()
+    })
 
 # Health check endpoints
 @app.route('/health', methods=['GET'])
