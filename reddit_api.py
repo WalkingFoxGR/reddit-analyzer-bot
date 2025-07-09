@@ -515,13 +515,11 @@ def search_endpoint():
     })
 
 @app.route('/search-and-analyze', methods=['POST'])
-def search_and_analyze_endpoint_fixed():
-    """Fixed progressive search and analysis for niche communities"""
+def search_and_analyze_endpoint():
+    """Simplified niche analysis without progress updates"""
     data = request.json
     query = data.get('query')
-    limit = min(data.get('limit', 20), 30)
     days = data.get('days', 7)
-    session_id = data.get('session_id', str(time.time()))
     
     if not query:
         return jsonify({'success': False, 'error': 'No search query provided'}), 400
@@ -613,11 +611,8 @@ def search_and_analyze_endpoint_fixed():
             'success': True,
             'query': query,
             'status': 'complete',
-            'count': len(results),
             'results': results,
-            'seed_subreddit': main_sub,
-            'analyzed_users': related.get('analyzed_users', 0),
-            'total_users': related.get('total_users', 0)
+            'seed_subreddit': main_sub
         }
         
         analyzer.analysis_cache[cache_key] = (time.time(), result)
