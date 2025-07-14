@@ -641,6 +641,87 @@ def cleanup_cache():
     for key in expired_keys:
         del analyzer.analysis_cache[key]
 
+
+@app.route('/scrape', methods=['POST'])
+def scrape_posts():
+    """Scrape post titles from a subreddit"""
+    data = request.json
+    subreddit_name = data.get('subreddit')
+    limit = min(data.get('limit', 10), 50)  # Max 50 posts
+    sort_type = data.get('sort', 'hot').lower()
+    time_filter = data.get('time_filter', 'week').lower()
+    
+    if not subreddit_name:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    # Validate parameters
+    valid_sorts = ['hot', 'top', 'new', 'rising']
+    valid_time_filters = ['hour', 'day', 'week', 'month', 'year', 'all']
+    
+    if sort_type not in valid_sorts:
+        return jsonify({'success': False, 'error': f'Invalid sort type. Use: {", ".join(valid_sorts)}'}), 400
+    
+    if sort_type == 'top' and time_filter not in valid_time_filters:
+        return jsonify({'success': False, 'error': f'Invalid time filter. Use: {", ".join(valid_time_filters)}'}), 400
+    
+    try:
+        subreddit = analyzer.reddit.subreddit(subreddit_name)
+        posts = []
+        
+        # Get posts based on sort type
+        if sort_type == 'hot':
+            post_generator = subreddit.hot(limit=limit)
+        elif sort_type == 'new':
+            post_generator = subreddit.new(limit=limit)
+        elif sort_type == 'rising':
+            post_generator = subreddit.rising(limit=limit)
+        elif sort_type == 'top':
+            post_generator = subreddit.top(time_filter=time_filter, limit=limit)
+        
+        # Extract post data
+        for i, post in enumerate(post_generator):
+            try:
+                # Format post date
+                post_date = datetime.utcfromtimestamp(post.created_utc)
+                
+                posts.append({
+                    'rank': i + 1,
+                    'title': post.title,
+                    'score': post.score,
+                    'comments': post.num_comments,
+                    'author': post.author.name if post.author else '[deleted]',
+                    'url': f"https://reddit.com{post.permalink}",
+                    'created_utc': post_date.isoformat(),
+                    'subreddit': post.subreddit.display_name,
+                    'flair': post.link_flair_text or 'None',
+                    'is_self': post.is_self,
+                    'upvote_ratio': post.upvote_ratio
+                })
+                
+                # Rate limiting
+                if i % 10 == 0 and i > 0:
+                    time.sleep(0.5)
+                    
+            except Exception as e:
+                logging.warning(f"Error processing post {i}: {e}")
+                continue
+        
+        return jsonify({
+            'success': True,
+            'subreddit': subreddit_name,
+            'sort_type': sort_type,
+            'time_filter': time_filter if sort_type == 'top' else None,
+            'limit': limit,
+            'count': len(posts),
+            'posts': posts,
+            'subscribers': subreddit.subscribers,
+            'scraped_at': datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        logging.error(f"Error scraping subreddit {subreddit_name}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # Add this route for health monitoring
 @app.route('/cache-status', methods=['GET'])
 def cache_status():
