@@ -417,6 +417,55 @@ analyzer = RedditAnalyzer()
 # Store for progressive analysis sessions
 analysis_sessions = {}
 
+def validate_subreddit(subreddit_name: str) -> Dict[str, Any]:
+    """Validate if a subreddit exists and is accessible"""
+    try:
+        subreddit = analyzer.reddit.subreddit(subreddit_name)
+        # Try to access a basic attribute to trigger the API call
+        _ = subreddit.display_name
+        # Check if it's private/banned by trying to access subscribers
+        try:
+            subscribers = subreddit.subscribers
+            if subscribers is None:
+                return {
+                    'valid': False,
+                    'error': 'private',
+                    'message': f'r/{subreddit_name} is private or restricted'
+                }
+        except Exception:
+            return {
+                'valid': False,
+                'error': 'forbidden',
+                'message': f'r/{subreddit_name} is private, banned, or restricted'
+            }
+        
+        return {
+            'valid': True,
+            'subscribers': subscribers,
+            'display_name': subreddit.display_name
+        }
+        
+    except Exception as e:
+        error_str = str(e).lower()
+        if 'redirect' in error_str or 'not found' in error_str:
+            return {
+                'valid': False,
+                'error': 'not_found',
+                'message': f'r/{subreddit_name} does not exist'
+            }
+        elif 'forbidden' in error_str or 'private' in error_str:
+            return {
+                'valid': False,
+                'error': 'forbidden',
+                'message': f'r/{subreddit_name} is private or restricted'
+            }
+        else:
+            return {
+                'valid': False,
+                'error': 'unknown',
+                'message': f'Error accessing r/{subreddit_name}: {str(e)}'
+            }
+
 @app.route('/analyze', methods=['POST'])
 def analyze_endpoint():
     """Enhanced analyze endpoint with posting times"""
@@ -427,12 +476,21 @@ def analyze_endpoint():
     if not subreddit:
         return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
     
+    # Validate subreddit exists
+    validation = validate_subreddit(subreddit)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
     result = analyzer.analyze_subreddit_with_timing(subreddit, days)
     return jsonify(result)
 
 @app.route('/analyze-multiple', methods=['POST'])
 def analyze_multiple_endpoint():
-    """Enhanced compare endpoint with posting times"""
+    """Enhanced compare endpoint with posting times and validation"""
     data = request.json
     subreddits_input = data.get('subreddits', [])
     days = data.get('days', 7)
@@ -445,8 +503,29 @@ def analyze_multiple_endpoint():
     if not subreddits:
         return jsonify({'success': False, 'error': 'No subreddits provided'}), 400
     
+    # Validate all subreddits first
+    invalid_subreddits = []
+    valid_subreddits = []
+    
+    for sub in subreddits:
+        validation = validate_subreddit(sub)
+        if not validation['valid']:
+            invalid_subreddits.append(f"r/{sub}: {validation['message']}")
+        else:
+            valid_subreddits.append(sub)
+    
+    # Return error if any subreddits are invalid
+    if invalid_subreddits:
+        return jsonify({
+            'success': False,
+            'error': 'Invalid subreddits found',
+            'invalid_subreddits': invalid_subreddits,
+            'valid_subreddits': valid_subreddits
+        }), 400
+    
+    # Continue with analysis for valid subreddits
     results = []
-    for i, sub in enumerate(subreddits):
+    for i, sub in enumerate(valid_subreddits):
         if i > 0:
             time.sleep(2)
         
@@ -478,9 +557,9 @@ def search_endpoint():
         main_sub = None
         for variation in [query, query.replace(' ', ''), query.replace(' ', '_')]:
             try:
-                sub = analyzer.reddit.subreddit(variation)
-                if sub.subscribers and sub.subscribers > 1000:
-                    main_sub = sub.display_name
+                validation = validate_subreddit(variation)
+                if validation['valid'] and validation['subscribers'] > 1000:
+                    main_sub = validation['display_name']
                     break
             except:
                 continue
@@ -535,10 +614,9 @@ def search_and_analyze_endpoint():
     main_sub = None
     for variation in [query, query.replace(' ', ''), query.replace(' ', '_')]:
         try:
-            sub = analyzer.reddit.subreddit(variation)
-            # Check if subreddit exists and has reasonable size
-            if hasattr(sub, 'subscribers') and sub.subscribers and sub.subscribers > 100:
-                main_sub = sub.display_name
+            validation = validate_subreddit(variation)
+            if validation['valid'] and validation['subscribers'] > 100:
+                main_sub = validation['display_name']
                 break
         except Exception as e:
             logging.debug(f"Variation {variation} failed: {e}")
@@ -628,20 +706,6 @@ def search_and_analyze_endpoint():
             'query': query
         })
 
-# Also add this helper method to clean up old cache entries periodically:
-def cleanup_cache():
-    """Remove expired cache entries"""
-    current_time = time.time()
-    expired_keys = []
-    
-    for key, (cached_time, _) in analyzer.analysis_cache.items():
-        if current_time - cached_time > 3600:  # 1 hour expiry
-            expired_keys.append(key)
-    
-    for key in expired_keys:
-        del analyzer.analysis_cache[key]
-
-
 @app.route('/scrape', methods=['POST'])
 def scrape_posts():
     """Scrape post titles from a subreddit"""
@@ -653,6 +717,15 @@ def scrape_posts():
     
     if not subreddit_name:
         return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    # Validate subreddit exists
+    validation = validate_subreddit(subreddit_name)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
     
     # Validate parameters
     valid_sorts = ['hot', 'top', 'new', 'rising']
@@ -721,6 +794,116 @@ def scrape_posts():
     except Exception as e:
         logging.error(f"Error scraping subreddit {subreddit_name}: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/rules', methods=['POST'])
+def get_subreddit_rules():
+    """Get subreddit rules and submission guidelines"""
+    data = request.json
+    subreddit_name = data.get('subreddit')
+    
+    if not subreddit_name:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    validation = validate_subreddit(subreddit_name)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    try:
+        subreddit = analyzer.reddit.subreddit(subreddit_name)
+        rules = []
+        
+        for rule in subreddit.rules:
+            rules.append({
+                'title': rule.short_name,
+                'description': rule.description,
+                'kind': rule.kind,
+                'priority': rule.priority
+            })
+        
+        return jsonify({
+            'success': True,
+            'subreddit': subreddit_name,
+            'rules': rules,
+            'submission_text': subreddit.submit_text or 'No submission guidelines',
+            'subscribers': subreddit.subscribers
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/flairs', methods=['POST'])
+def analyze_flairs():
+    """Analyze flair performance and effectiveness"""
+    data = request.json
+    subreddit_name = data.get('subreddit')
+    
+    if not subreddit_name:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    validation = validate_subreddit(subreddit_name)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    try:
+        subreddit = analyzer.reddit.subreddit(subreddit_name)
+        flair_stats = {}
+        
+        for post in subreddit.hot(limit=100):
+            flair = post.link_flair_text or 'No Flair'
+            if flair not in flair_stats:
+                flair_stats[flair] = {
+                    'count': 0,
+                    'total_score': 0,
+                    'total_comments': 0
+                }
+            
+            flair_stats[flair]['count'] += 1
+            flair_stats[flair]['total_score'] += post.score
+            flair_stats[flair]['total_comments'] += post.num_comments
+        
+        # Calculate averages
+        flair_analysis = []
+        for flair, stats in flair_stats.items():
+            if stats['count'] > 0:
+                flair_analysis.append({
+                    'flair': flair,
+                    'post_count': stats['count'],
+                    'avg_score': round(stats['total_score'] / stats['count'], 2),
+                    'avg_comments': round(stats['total_comments'] / stats['count'], 2)
+                })
+        
+        # Sort by average score
+        flair_analysis.sort(key=lambda x: x['avg_score'], reverse=True)
+        
+        return jsonify({
+            'success': True,
+            'subreddit': subreddit_name,
+            'flair_analysis': flair_analysis,
+            'subscribers': subreddit.subscribers,
+            'analyzed_posts': sum(stats['count'] for stats in flair_stats.values())
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# Helper method to clean up old cache entries periodically
+def cleanup_cache():
+    """Remove expired cache entries"""
+    current_time = time.time()
+    expired_keys = []
+    
+    for key, (cached_time, _) in analyzer.analysis_cache.items():
+        if current_time - cached_time > 3600:  # 1 hour expiry
+            expired_keys.append(key)
+    
+    for key in expired_keys:
+        del analyzer.analysis_cache[key]
 
 # Add this route for health monitoring
 @app.route('/cache-status', methods=['GET'])
