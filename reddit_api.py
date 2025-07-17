@@ -11,6 +11,20 @@ from collections import defaultdict, Counter
 import threading
 import queue
 import pytz
+from prawcore.exceptions import RequestException, ResponseException
+
+def safe_reddit_call(func, max_retries=3):
+    """Wrapper to retry Reddit API calls"""
+    for i in range(max_retries):
+        try:
+            return func()
+        except (RequestException, ResponseException) as e:
+            if i < max_retries - 1:
+                wait_time = 2 ** i  # Exponential backoff: 1, 2, 4 seconds
+                logging.warning(f"Reddit API error, retrying in {wait_time}s: {e}")
+                time.sleep(wait_time)
+            else:
+                raise
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +40,8 @@ class RedditAnalyzer:
             client_id=REDDIT_CLIENT_ID,
             client_secret=REDDIT_CLIENT_SECRET,
             user_agent=REDDIT_USER_AGENT,
-            ratelimit_seconds=300
+            ratelimit_seconds=300,
+            timeout=30  # ADD THIS LINE
         )
         
         # Cache for analysis results
@@ -79,8 +94,8 @@ class RedditAnalyzer:
     def analyze_posting_times(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """Analyze best posting times for a subreddit"""
         try:
-            subreddit = self.reddit.subreddit(subreddit_name)
-            
+            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+
             # Data structures for time analysis
             hourly_scores = defaultdict(list)
             hourly_comments = defaultdict(list)
@@ -362,7 +377,7 @@ class RedditAnalyzer:
     def analyze_subreddit(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """Enhanced subreddit analysis with top post information"""
         try:
-            subreddit = self.reddit.subreddit(subreddit_name)
+            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             subscribers = subreddit.subscribers
             date_threshold = datetime.utcnow() - timedelta(days=days)
             
