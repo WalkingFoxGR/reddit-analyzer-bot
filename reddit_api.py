@@ -11,20 +11,6 @@ from collections import defaultdict, Counter
 import threading
 import queue
 import pytz
-from prawcore.exceptions import RequestException, ResponseException
-
-def safe_reddit_call(func, max_retries=3):
-    """Wrapper to retry Reddit API calls"""
-    for i in range(max_retries):
-        try:
-            return func()
-        except (RequestException, ResponseException) as e:
-            if i < max_retries - 1:
-                wait_time = 2 ** i  # Exponential backoff: 1, 2, 4 seconds
-                logging.warning(f"Reddit API error, retrying in {wait_time}s: {e}")
-                time.sleep(wait_time)
-            else:
-                raise
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -40,8 +26,7 @@ class RedditAnalyzer:
             client_id=REDDIT_CLIENT_ID,
             client_secret=REDDIT_CLIENT_SECRET,
             user_agent=REDDIT_USER_AGENT,
-            ratelimit_seconds=300,
-            timeout=30  # ADD THIS LINE
+            ratelimit_seconds=300
         )
         
         # Cache for analysis results
@@ -94,8 +79,8 @@ class RedditAnalyzer:
     def analyze_posting_times(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """Analyze best posting times for a subreddit"""
         try:
-            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
-
+            subreddit = self.reddit.subreddit(subreddit_name)
+            
             # Data structures for time analysis
             hourly_scores = defaultdict(list)
             hourly_comments = defaultdict(list)
@@ -375,9 +360,9 @@ class RedditAnalyzer:
             return {'success': False, 'error': str(e)}
     
     def analyze_subreddit(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
-        """Enhanced subreddit analysis with top post information"""
+        """Basic subreddit analysis"""
         try:
-            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            subreddit = self.reddit.subreddit(subreddit_name)
             subscribers = subreddit.subscribers
             date_threshold = datetime.utcnow() - timedelta(days=days)
             
@@ -385,11 +370,6 @@ class RedditAnalyzer:
             total_score = 0
             total_comments = 0
             
-            # Track top post
-            top_post = None
-            top_post_score = 0
-            
-            # Analyze new posts for averages
             for post in subreddit.new(limit=300):
                 post_date = datetime.utcfromtimestamp(post.created_utc)
                 if post_date < date_threshold:
@@ -399,44 +379,8 @@ class RedditAnalyzer:
                 total_score += post.score
                 total_comments += post.num_comments
                 
-                # Track highest scoring post
-                if post.score > top_post_score:
-                    top_post_score = post.score
-                    top_post = {
-                        'title': post.title,
-                        'score': post.score,
-                        'author': post.author.name if post.author else '[deleted]',
-                        'comments': post.num_comments,
-                        'url': f"https://reddit.com{post.permalink}",
-                        'created_utc': datetime.utcfromtimestamp(post.created_utc).isoformat(),
-                        'upvote_ratio': post.upvote_ratio,
-                        'flair': post.link_flair_text or 'No Flair'
-                    }
-                
                 if post_count % 50 == 0:
                     time.sleep(0.5)
-            
-            # Also check top posts from the time period to ensure we get the actual top post
-            try:
-                # Get the top post from the specified time period
-                time_filter = 'week' if days <= 7 else 'month' if days <= 30 else 'all'
-                
-                for post in subreddit.top(time_filter=time_filter, limit=10):
-                    post_date = datetime.utcfromtimestamp(post.created_utc)
-                    if post_date >= date_threshold and post.score > top_post_score:
-                        top_post_score = post.score
-                        top_post = {
-                            'title': post.title,
-                            'score': post.score,
-                            'author': post.author.name if post.author else '[deleted]',
-                            'comments': post.num_comments,
-                            'url': f"https://reddit.com{post.permalink}",
-                            'created_utc': datetime.utcfromtimestamp(post.created_utc).isoformat(),
-                            'upvote_ratio': post.upvote_ratio,
-                            'flair': post.link_flair_text or 'No Flair'
-                        }
-            except Exception as e:
-                logging.warning(f"Error getting top posts: {e}")
             
             avg_posts_per_day = post_count / days
             avg_score_per_post = total_score / post_count if post_count > 0 else 0
@@ -455,165 +399,12 @@ class RedditAnalyzer:
                 'avg_score_per_post': round(avg_score_per_post, 2),
                 'avg_comments_per_post': round(avg_comments_per_post, 2),
                 'effectiveness_score': round(effectiveness, 2),
-                'days_analyzed': days,
-                'top_post': top_post  # Add the top post information
+                'days_analyzed': days
             }
         except Exception as e:
             logging.error(f"Error analyzing subreddit {subreddit_name}: {e}")
             return {'success': False, 'error': str(e)}
-
-    def analyze_user(self, username: str, days: int = 30, limit: int = 100) -> Dict[str, Any]:
-        """Analyze a Reddit user's posting activity and performance"""
-        try:
-            user = self.reddit.redditor(username)
-            
-            # Get basic user info
-            try:
-                user_info = {
-                    'username': user.name,
-                    'total_karma': user.total_karma,
-                    'link_karma': user.link_karma,
-                    'comment_karma': user.comment_karma,
-                    'account_created': datetime.utcfromtimestamp(user.created_utc).isoformat(),
-                    'account_age_days': (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days,
-                    'is_verified': user.verified if hasattr(user, 'verified') else False,
-                    'has_premium': user.is_gold if hasattr(user, 'is_gold') else False
-                }
-            except Exception as e:
-                logging.warning(f"Error getting user info: {e}")
-                user_info = {'username': username, 'error': 'User info not accessible'}
-            
-            # Analyze recent submissions
-            date_threshold = datetime.utcnow() - timedelta(days=days)
-            submissions = []
-            subreddit_stats = defaultdict(lambda: {'count': 0, 'total_score': 0, 'total_comments': 0})
-            
-            total_score = 0
-            total_comments = 0
-            submission_count = 0
-            
-            # Track top posts
-            top_posts = []
-            
-            try:
-                for submission in user.submissions.new(limit=limit):
-                    submission_date = datetime.utcfromtimestamp(submission.created_utc)
-                    
-                    if submission_date < date_threshold:
-                        continue
-                    
-                    submission_data = {
-                        'title': submission.title,
-                        'subreddit': submission.subreddit.display_name,
-                        'score': submission.score,
-                        'comments': submission.num_comments,
-                        'upvote_ratio': submission.upvote_ratio,
-                        'url': f"https://reddit.com{submission.permalink}",
-                        'created_utc': submission_date.isoformat(),
-                        'flair': submission.link_flair_text or 'No Flair',
-                        'is_self': submission.is_self,
-                        'is_nsfw': submission.over_18,
-                        'is_spoiler': submission.spoiler,
-                        'num_crossposts': submission.num_crossposts
-                    }
-                    
-                    submissions.append(submission_data)
-                    
-                    # Update subreddit statistics
-                    subreddit_name = submission.subreddit.display_name
-                    subreddit_stats[subreddit_name]['count'] += 1
-                    subreddit_stats[subreddit_name]['total_score'] += submission.score
-                    subreddit_stats[subreddit_name]['total_comments'] += submission.num_comments
-                    
-                    # Track totals
-                    total_score += submission.score
-                    total_comments += submission.num_comments
-                    submission_count += 1
-                    
-                    # Add to top posts if it's good enough
-                    top_posts.append(submission_data)
-                    
-                    # Rate limiting
-                    if submission_count % 20 == 0:
-                        time.sleep(0.3)
-                        
-            except Exception as e:
-                logging.warning(f"Error analyzing user submissions: {e}")
-            
-            # Sort submissions by score
-            submissions.sort(key=lambda x: x['score'], reverse=True)
-            top_posts.sort(key=lambda x: x['score'], reverse=True)
-            
-            # Calculate averages
-            avg_score_per_post = total_score / submission_count if submission_count > 0 else 0
-            avg_comments_per_post = total_comments / submission_count if submission_count > 0 else 0
-            posts_per_day = submission_count / days
-            
-            # Process subreddit statistics
-            subreddit_performance = []
-            for subreddit, stats in subreddit_stats.items():
-                if stats['count'] > 0:
-                    subreddit_performance.append({
-                        'subreddit': subreddit,
-                        'post_count': stats['count'],
-                        'total_score': stats['total_score'],
-                        'total_comments': stats['total_comments'],
-                        'avg_score': round(stats['total_score'] / stats['count'], 2),
-                        'avg_comments': round(stats['total_comments'] / stats['count'], 2)
-                    })
-            
-            # Sort subreddits by total score
-            subreddit_performance.sort(key=lambda x: x['total_score'], reverse=True)
-            
-            # Analyze comment activity
-            comment_count = 0
-            comment_score = 0
-            try:
-                for comment in user.comments.new(limit=100):
-                    comment_date = datetime.utcfromtimestamp(comment.created_utc)
-                    if comment_date >= date_threshold:
-                        comment_count += 1
-                        comment_score += comment.score
-                        
-                        if comment_count % 25 == 0:
-                            time.sleep(0.2)
-            except Exception as e:
-                logging.warning(f"Error analyzing comments: {e}")
-            
-            avg_comment_score = comment_score / comment_count if comment_count > 0 else 0
-            
-            return {
-                'success': True,
-                'username': username,
-                'user_info': user_info,
-                'analysis_period': {
-                    'days': days,
-                    'from_date': date_threshold.isoformat(),
-                    'to_date': datetime.utcnow().isoformat()
-                },
-                'submission_stats': {
-                    'total_submissions': submission_count,
-                    'total_score': total_score,
-                    'total_comments': total_comments,
-                    'avg_score_per_post': round(avg_score_per_post, 2),
-                    'avg_comments_per_post': round(avg_comments_per_post, 2),
-                    'posts_per_day': round(posts_per_day, 2)
-                },
-                'comment_stats': {
-                    'total_comments': comment_count,
-                    'total_comment_score': comment_score,
-                    'avg_comment_score': round(avg_comment_score, 2)
-                },
-                'top_posts': top_posts[:10],  # Top 10 posts
-                'recent_posts': submissions[:20],  # 20 most recent posts
-                'subreddit_performance': subreddit_performance[:15],  # Top 15 subreddits
-                'analyzed_at': datetime.utcnow().isoformat()
-            }
-            
-        except Exception as e:
-            logging.error(f"Error analyzing user {username}: {e}")
-            return {'success': False, 'error': str(e)}
-
+    
     def parse_compare_input(self, input_text: str) -> List[str]:
         """Parse flexible compare input formats"""
         cleaned = re.sub(r'\s+', ' ', input_text.strip())
@@ -695,61 +486,6 @@ def analyze_endpoint():
         }), 400
     
     result = analyzer.analyze_subreddit_with_timing(subreddit, days)
-    return jsonify(result)
-
-@app.route('/analyze-user', methods=['POST'])
-def analyze_user_endpoint():
-    """Analyze a Reddit user's posting activity and performance"""
-    data = request.json
-    username = data.get('username')
-    days = data.get('days', 30)
-    limit = data.get('limit', 100)
-    
-    if not username:
-        return jsonify({'success': False, 'error': 'No username provided'}), 400
-    
-    # Remove u/ prefix if present
-    username = username.replace('u/', '').replace('/u/', '')
-    
-    # Validate user exists
-    try:
-        user = analyzer.reddit.redditor(username)
-        # Try to access a basic attribute to check if user exists
-        _ = user.name
-        
-        # Check if user is suspended/banned
-        try:
-            _ = user.created_utc
-        except Exception as e:
-            if 'suspended' in str(e).lower() or 'banned' in str(e).lower():
-                return jsonify({
-                    'success': False,
-                    'error': f'User u/{username} is suspended or banned',
-                    'error_type': 'suspended'
-                }), 400
-            else:
-                return jsonify({
-                    'success': False,
-                    'error': f'Cannot access user u/{username}: {str(e)}',
-                    'error_type': 'access_denied'
-                }), 400
-                
-    except Exception as e:
-        error_str = str(e).lower()
-        if 'not found' in error_str or 'redirect' in error_str:
-            return jsonify({
-                'success': False,
-                'error': f'User u/{username} does not exist',
-                'error_type': 'not_found'
-            }), 400
-        else:
-            return jsonify({
-                'success': False,
-                'error': f'Error accessing user u/{username}: {str(e)}',
-                'error_type': 'unknown'
-            }), 400
-    
-    result = analyzer.analyze_user(username, days, limit)
     return jsonify(result)
 
 @app.route('/analyze-multiple', methods=['POST'])
@@ -1093,8 +829,7 @@ def get_subreddit_rules():
             'subreddit': subreddit_name,
             'rules': rules,
             'submission_text': subreddit.submit_text or 'No submission guidelines',
-            'subscribers': subreddit.subscribers,
-            'public_description': subreddit.public_description or 'No description'
+            'subscribers': subreddit.subscribers
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1152,7 +887,6 @@ def analyze_flairs():
             'subreddit': subreddit_name,
             'flair_analysis': flair_analysis,
             'subscribers': subreddit.subscribers,
-            'public_description': subreddit.public_description or 'No description',
             'analyzed_posts': sum(stats['count'] for stats in flair_stats.values())
         })
     except Exception as e:
