@@ -360,55 +360,32 @@ class RedditAnalyzer:
             return {'success': False, 'error': str(e)}
     
     def analyze_subreddit(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
-    """Enhanced subreddit analysis with top post information"""
-    try:
-        subreddit = self.reddit.subreddit(subreddit_name)
-        subscribers = subreddit.subscribers
-        date_threshold = datetime.utcnow() - timedelta(days=days)
-        
-        post_count = 0
-        total_score = 0
-        total_comments = 0
-        
-        # Track top post
-        top_post = None
-        top_post_score = 0
-        
-        # Analyze new posts for averages
-        for post in subreddit.new(limit=300):
-            post_date = datetime.utcfromtimestamp(post.created_utc)
-            if post_date < date_threshold:
-                break
-            
-            post_count += 1
-            total_score += post.score
-            total_comments += post.num_comments
-            
-            # Track highest scoring post
-            if post.score > top_post_score:
-                top_post_score = post.score
-                top_post = {
-                    'title': post.title,
-                    'score': post.score,
-                    'author': post.author.name if post.author else '[deleted]',
-                    'comments': post.num_comments,
-                    'url': f"https://reddit.com{post.permalink}",
-                    'created_utc': datetime.utcfromtimestamp(post.created_utc).isoformat(),
-                    'upvote_ratio': post.upvote_ratio,
-                    'flair': post.link_flair_text or 'No Flair'
-                }
-            
-            if post_count % 50 == 0:
-                time.sleep(0.5)
-        
-        # Also check top posts from the time period to ensure we get the actual top post
+        """Enhanced subreddit analysis with top post information"""
         try:
-            # Get the top post from the specified time period
-            time_filter = 'week' if days <= 7 else 'month' if days <= 30 else 'all'
+            subreddit = self.reddit.subreddit(subreddit_name)
+            subscribers = subreddit.subscribers
+            date_threshold = datetime.utcnow() - timedelta(days=days)
             
-            for post in subreddit.top(time_filter=time_filter, limit=10):
+            post_count = 0
+            total_score = 0
+            total_comments = 0
+            
+            # Track top post
+            top_post = None
+            top_post_score = 0
+            
+            # Analyze new posts for averages
+            for post in subreddit.new(limit=300):
                 post_date = datetime.utcfromtimestamp(post.created_utc)
-                if post_date >= date_threshold and post.score > top_post_score:
+                if post_date < date_threshold:
+                    break
+                
+                post_count += 1
+                total_score += post.score
+                total_comments += post.num_comments
+                
+                # Track highest scoring post
+                if post.score > top_post_score:
                     top_post_score = post.score
                     top_post = {
                         'title': post.title,
@@ -420,32 +397,55 @@ class RedditAnalyzer:
                         'upvote_ratio': post.upvote_ratio,
                         'flair': post.link_flair_text or 'No Flair'
                     }
+                
+                if post_count % 50 == 0:
+                    time.sleep(0.5)
+            
+            # Also check top posts from the time period to ensure we get the actual top post
+            try:
+                # Get the top post from the specified time period
+                time_filter = 'week' if days <= 7 else 'month' if days <= 30 else 'all'
+                
+                for post in subreddit.top(time_filter=time_filter, limit=10):
+                    post_date = datetime.utcfromtimestamp(post.created_utc)
+                    if post_date >= date_threshold and post.score > top_post_score:
+                        top_post_score = post.score
+                        top_post = {
+                            'title': post.title,
+                            'score': post.score,
+                            'author': post.author.name if post.author else '[deleted]',
+                            'comments': post.num_comments,
+                            'url': f"https://reddit.com{post.permalink}",
+                            'created_utc': datetime.utcfromtimestamp(post.created_utc).isoformat(),
+                            'upvote_ratio': post.upvote_ratio,
+                            'flair': post.link_flair_text or 'No Flair'
+                        }
+            except Exception as e:
+                logging.warning(f"Error getting top posts: {e}")
+            
+            avg_posts_per_day = post_count / days
+            avg_score_per_post = total_score / post_count if post_count > 0 else 0
+            avg_comments_per_post = total_comments / post_count if post_count > 0 else 0
+            
+            effectiveness = self.calculate_effectiveness(
+                avg_posts_per_day, avg_score_per_post, 
+                avg_comments_per_post, subscribers
+            )
+            
+            return {
+                'success': True,
+                'subreddit': subreddit_name,
+                'subscribers': subscribers,
+                'avg_posts_per_day': round(avg_posts_per_day, 2),
+                'avg_score_per_post': round(avg_score_per_post, 2),
+                'avg_comments_per_post': round(avg_comments_per_post, 2),
+                'effectiveness_score': round(effectiveness, 2),
+                'days_analyzed': days,
+                'top_post': top_post  # Add the top post information
+            }
         except Exception as e:
-            logging.warning(f"Error getting top posts: {e}")
-        
-        avg_posts_per_day = post_count / days
-        avg_score_per_post = total_score / post_count if post_count > 0 else 0
-        avg_comments_per_post = total_comments / post_count if post_count > 0 else 0
-        
-        effectiveness = self.calculate_effectiveness(
-            avg_posts_per_day, avg_score_per_post, 
-            avg_comments_per_post, subscribers
-        )
-        
-        return {
-            'success': True,
-            'subreddit': subreddit_name,
-            'subscribers': subscribers,
-            'avg_posts_per_day': round(avg_posts_per_day, 2),
-            'avg_score_per_post': round(avg_score_per_post, 2),
-            'avg_comments_per_post': round(avg_comments_per_post, 2),
-            'effectiveness_score': round(effectiveness, 2),
-            'days_analyzed': days,
-            'top_post': top_post  # Add the top post information
-        }
-    except Exception as e:
-        logging.error(f"Error analyzing subreddit {subreddit_name}: {e}")
-        return {'success': False, 'error': str(e)}
+            logging.error(f"Error analyzing subreddit {subreddit_name}: {e}")
+            return {'success': False, 'error': str(e)}
     
     def parse_compare_input(self, input_text: str) -> List[str]:
         """Parse flexible compare input formats"""
