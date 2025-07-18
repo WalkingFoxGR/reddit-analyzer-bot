@@ -150,24 +150,20 @@ class RedditAnalyzer:
             if analysis_data.get('posting_times'):
                 posting_times = analysis_data['posting_times']
                 
-                # Best hours (top 3)
-                if posting_times.get('best_hours'):
-                    best_hours = posting_times['best_hours'][:3]
-                    for i, hour_data in enumerate(best_hours):
-                        record_data[f'Best_Hour_{i+1}'] = hour_data.get('hour', -1)
-                        record_data[f'Best_Hour_{i+1}_Score'] = hour_data.get('avg_score', 0)
-                        record_data[f'Best_Hour_{i+1}_Comments'] = hour_data.get('avg_comments', 0)
-                        record_data[f'Best_Hour_{i+1}_Competition'] = hour_data.get('competition', '')
+
+                # Best hour (just the #1)
+                if posting_times.get('best_hours') and len(posting_times['best_hours']) > 0:
+                    best_hour = posting_times['best_hours'][0]
+                    record_data['Best_Hour'] = best_hour.get('hour', -1)
+                    record_data['Best_Hour_Score'] = best_hour.get('avg_score', 0)
                 
-                # Best days (top 3)
-                if posting_times.get('best_days'):
-                    best_days = posting_times['best_days'][:3]
-                    for i, day_data in enumerate(best_days):
-                        record_data[f'Best_Day_{i+1}'] = day_data.get('day', '')
-                        record_data[f'Best_Day_{i+1}_Score'] = day_data.get('avg_score', 0)
+                # Best day (just the #1)
+                if posting_times.get('best_days') and len(posting_times['best_days']) > 0:
+                    best_day = posting_times['best_days'][0]
+                    record_data['Best_Day'] = best_day.get('day', '')
                 
                 record_data['Posts_Analyzed_For_Timing'] = posting_times.get('posts_analyzed', 0)
-            
+
             # Update existing record or create new one
             if existing:
                 # Keep existing karma requirements data
