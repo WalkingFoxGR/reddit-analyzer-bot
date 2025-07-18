@@ -292,28 +292,23 @@ class RedditAnalyzer:
                 'error': str(e)
             }
     
-    def analyze_karma_requirements(self, subreddit_name: str) -> Dict[str, Any]:
-        """Analyze karma requirements with enhanced caching and verification detection"""
+    def analyze_karma_requirements(self, subreddit_name: str, post_limit: int = 150) -> Dict[str, Any]:
+        """Analyze karma requirements with configurable post limit"""
         
         # Check Airtable cache first
         if self.airtable:
             try:
-                # Use exact field names from your Airtable (case-sensitive)
                 records = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
                 if records:
                     record = records[0]['fields']
                     
-                    # Fix date parsing with multiple format support
                     try:
                         last_updated_str = record.get('Last_Updated', '2000-01-01')
                         if 'T' in last_updated_str:
-                            # ISO format with timezone
                             last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
                         else:
-                            # Simple date format
                             last_updated = datetime.strptime(last_updated_str, '%Y-%m-%d')
                             
-                        # Make timezone-aware if needed
                         if last_updated.tzinfo is None:
                             last_updated = last_updated.replace(tzinfo=timezone.utc)
                             
@@ -321,7 +316,6 @@ class RedditAnalyzer:
                         logging.warning(f"Date parsing error: {e}")
                         last_updated = datetime(2000, 1, 1, tzinfo=timezone.utc)
                     
-                    # Check if data is fresh (30 days)
                     if (datetime.now(timezone.utc) - last_updated).days < 30:
                         logging.info(f"Using cached karma data for {subreddit_name}")
                         return {
@@ -341,18 +335,17 @@ class RedditAnalyzer:
         
         # Analyze if not cached or cache failed
         try:
-            logging.info(f"Starting fresh karma analysis for {subreddit_name}")
+            logging.info(f"Starting karma analysis for {subreddit_name} with {post_limit} posts")
             subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
-            # Track minimum karma found
             min_post_karma = float('inf')
             min_comment_karma = float('inf')
             min_account_age = float('inf')
             
             users_analyzed = set()
             
-            # Analyze recent posts and authors
-            for post in subreddit.new(limit=50):
+            # Analyze recent posts and authors with configurable limit
+            for post in subreddit.new(limit=post_limit):
                 try:
                     if not post.author or post.author.name in users_analyzed:
                         continue
@@ -360,17 +353,14 @@ class RedditAnalyzer:
                     users_analyzed.add(post.author.name)
                     user = safe_reddit_call(lambda: self.reddit.redditor(post.author.name))
                     
-                    # Get both post karma (link_karma) and comment karma
                     post_karma = getattr(user, 'link_karma', 0)
                     comment_karma = getattr(user, 'comment_karma', 0)
                     
-                    # Track minimums
                     if post_karma < min_post_karma:
                         min_post_karma = post_karma
                     if comment_karma < min_comment_karma:
                         min_comment_karma = comment_karma
                         
-                    # Account age in days
                     try:
                         account_age = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
                         if account_age < min_account_age:
@@ -378,7 +368,6 @@ class RedditAnalyzer:
                     except (AttributeError, OSError):
                         pass
                     
-                    # Rate limiting
                     if len(users_analyzed) % 10 == 0:
                         time.sleep(0.3)
                         
@@ -386,9 +375,9 @@ class RedditAnalyzer:
                     logging.warning(f"Error analyzing user: {e}")
                     continue
             
-            logging.info(f"Analyzed {len(users_analyzed)} users for {subreddit_name}")
+            logging.info(f"Analyzed {len(users_analyzed)} users from {post_limit} posts for {subreddit_name}")
             
-            # Calculate requirements (subtract 1 for buffer)
+            # Calculate requirements
             post_karma_req = max(0, min_post_karma - 1) if min_post_karma != float('inf') else 0
             comment_karma_req = max(0, min_comment_karma - 1) if min_comment_karma != float('inf') else 0
             account_age_req = max(0, min_account_age - 1) if min_account_age != float('inf') else 0
@@ -401,7 +390,7 @@ class RedditAnalyzer:
             else:
                 confidence = 'Low'
             
-            # **ENHANCED VERIFICATION DETECTION**
+            # Enhanced verification detection
             verification_check = self.check_verification_requirements(subreddit_name)
             
             result = {
@@ -416,23 +405,16 @@ class RedditAnalyzer:
                 'verification_confidence': verification_check['confidence'],
                 'rules_based_verification': verification_check['rules_based'],
                 'flair_based_verification': verification_check['flair_based'],
-                'users_analyzed': len(users_analyzed)
+                'users_analyzed': len(users_analyzed),
+                'posts_scraped': post_limit
             }
             
-            logging.info(f"Karma analysis result for {subreddit_name}: {result}")
-            
-            # **FIXED AIRTABLE SAVING** - Use exact field names and proper date format
+            # Save to Airtable
             if self.airtable:
                 try:
-                    logging.info(f"Saving to Airtable for {subreddit_name}")
-                    
-                    # Check if record exists
                     existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
-                    
-                    # Use ISO date format (YYYY-MM-DD)
                     current_date = datetime.utcnow().strftime('%Y-%m-%d')
                     
-                    # **CRITICAL: Use exact field names from your Airtable**
                     record_data = {
                         'Subreddit': subreddit_name,
                         'Post_Karma_Min': result['post_karma_min'],
@@ -441,25 +423,19 @@ class RedditAnalyzer:
                         'Confidence': result['confidence'],
                         'Requires_Verification': result['requires_verification'],
                         'Verification_Method': result['verification_method'],
-                        'Last_Updated': current_date
+                        'Last_Updated': current_date,
+                        'Posts_Analyzed': post_limit
                     }
                     
-                    logging.info(f"Airtable record data: {record_data}")
-                    
                     if existing:
-                        # Update existing record
                         updated = self.karma_table.update(existing[0]['id'], record_data)
                         logging.info(f"Updated Airtable record: {updated['id']}")
                     else:
-                        # Create new record
                         created = self.karma_table.create(record_data)
                         logging.info(f"Created Airtable record: {created['id']}")
-                    
-                    logging.info(f"Successfully saved to Airtable for {subreddit_name}")
                             
                 except Exception as e:
                     logging.error(f"Airtable save failed for {subreddit_name}: {e}")
-                    logging.error(f"Error details: {type(e).__name__}: {str(e)}")
             
             return result
             
@@ -519,27 +495,42 @@ class RedditAnalyzer:
             
             has_fake_upvotes = len(suspicious_posts) > 0
             
-            # Update Airtable if exists
-            if self.airtable and has_fake_upvotes:
-                try:
-                    existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
-                    if existing:
-                        self.karma_table.update(existing[0]['id'], {
-                            'Has_Fake_Upvotes': has_fake_upvotes,
-                            'Analysis_Data': json.dumps(suspicious_posts[:5])  # Store top 5
-                        })
-                except Exception:
-                    pass
-            
             return {
                 'success': True,
                 'has_suspicious_activity': has_fake_upvotes,
                 'median_score': median_score if 'median_score' in locals() else 0,
-                'suspicious_posts': suspicious_posts[:3],  # Return top 3
+                'suspicious_posts': suspicious_posts[:3],
                 'confidence': 'High' if len(suspicious_posts) > 5 else 'Medium' if len(suspicious_posts) > 0 else 'Low'
             }
             
         except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def analyze_posting_requirements(self, subreddit_name: str, post_limit: int = 150) -> Dict[str, Any]:
+        """Separate function for posting requirements analysis"""
+        try:
+            logging.info(f"Starting posting requirements analysis for {subreddit_name}")
+            
+            # Get karma requirements
+            karma_req = self.analyze_karma_requirements(subreddit_name, post_limit)
+            
+            # Get fake upvote detection
+            fake_upvotes = self.detect_fake_upvotes(subreddit_name)
+            
+            # Get basic subreddit info
+            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            return {
+                'success': True,
+                'subreddit': subreddit_name,
+                'subscribers': subreddit.subscribers,
+                'karma_requirements': karma_req,
+                'fake_upvote_detection': fake_upvotes,
+                'analyzed_at': datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logging.error(f"Error in posting requirements analysis: {e}")
             return {'success': False, 'error': str(e)}
     
     def find_related_subreddits_progressive(self, seed_subreddit: str, max_users: int = 100,
@@ -672,7 +663,7 @@ class RedditAnalyzer:
             }
     
     def analyze_subreddit_with_timing(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
-        """Enhanced subreddit analysis including best posting times AND restrictions"""
+        """FAST subreddit analysis WITHOUT posting requirements"""
         try:
             # Get basic analysis
             basic_analysis = self.analyze_subreddit(subreddit_name, days)
@@ -683,15 +674,6 @@ class RedditAnalyzer:
             # Add timing analysis
             timing_analysis = self.analyze_posting_times(subreddit_name, days)
             basic_analysis['posting_times'] = timing_analysis
-            
-            # ADD RESTRICTIONS ANALYSIS
-            karma_req = self.analyze_karma_requirements(subreddit_name)
-            fake_upvotes = self.detect_fake_upvotes(subreddit_name)
-            
-            basic_analysis['restrictions'] = {
-                'karma_requirements': karma_req,
-                'fake_upvote_detection': fake_upvotes
-            }
             
             # Format best times message
             if timing_analysis['best_hours']:
@@ -1029,9 +1011,11 @@ def validate_subreddit(subreddit_name: str) -> Dict[str, Any]:
                 'message': f'Error accessing r/{subreddit_name}: {str(e)}'
             }
 
+# ==== ENDPOINTS ====
+
 @app.route('/analyze', methods=['POST'])
 def analyze_endpoint():
-    """Enhanced analyze endpoint with posting times"""
+    """FAST analyze endpoint WITHOUT posting requirements"""
     data = request.json
     subreddit = data.get('subreddit')
     days = data.get('days', 7)
@@ -1050,6 +1034,71 @@ def analyze_endpoint():
     
     result = analyzer.analyze_subreddit_with_timing(subreddit, days)
     return jsonify(result)
+
+@app.route('/requirements', methods=['POST'])
+def requirements_endpoint():
+    """Separate endpoint for posting requirements analysis"""
+    data = request.json
+    subreddit = data.get('subreddit')
+    post_limit = data.get('post_limit', 150)  # Configurable limit
+    
+    # Validate post_limit
+    if post_limit < 10:
+        post_limit = 10
+    elif post_limit > 500:  # Max limit to prevent abuse
+        post_limit = 500
+    
+    if not subreddit:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    # Validate subreddit exists
+    validation = validate_subreddit(subreddit)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    result = analyzer.analyze_posting_requirements(subreddit, post_limit)
+    return jsonify(result)
+
+@app.route('/analyze-complete', methods=['POST'])
+def analyze_complete_endpoint():
+    """Complete analysis WITH posting requirements (slower)"""
+    data = request.json
+    subreddit = data.get('subreddit')
+    days = data.get('days', 7)
+    post_limit = data.get('post_limit', 150)
+    
+    if not subreddit:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    # Validate subreddit exists
+    validation = validate_subreddit(subreddit)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    # Get basic analysis
+    basic_result = analyzer.analyze_subreddit_with_timing(subreddit, days)
+    
+    if not basic_result['success']:
+        return jsonify(basic_result)
+    
+    # Add posting requirements
+    requirements_result = analyzer.analyze_posting_requirements(subreddit, post_limit)
+    
+    if requirements_result['success']:
+        basic_result['restrictions'] = {
+            'karma_requirements': requirements_result['karma_requirements'],
+            'fake_upvote_detection': requirements_result['fake_upvote_detection']
+        }
+    
+    return jsonify(basic_result)
 
 @app.route('/analyze-user', methods=['POST'])
 def analyze_user_endpoint():
