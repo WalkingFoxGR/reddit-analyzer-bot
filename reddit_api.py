@@ -109,94 +109,89 @@ class RedditAnalyzer:
         
         return min(100, max(0, effectiveness))
     
-    def save_analyze_to_airtable(self, analysis_data: Dict[str, Any]) -> bool:
-        """Save or update analyze metrics in Airtable"""
-        if not self.airtable:
-            logging.warning("Airtable not initialized, skipping save")
-            return False
+def save_analyze_to_airtable(self, analysis_data: Dict[str, Any]) -> bool:
+    """Save or update analyze metrics in Airtable"""
+    if not self.airtable:
+        logging.warning("Airtable not initialized, skipping save")
+        return False
+    
+    try:
+        subreddit_name = analysis_data['subreddit']
         
-        try:
-            subreddit_name = analysis_data['subreddit']
+        # Check if record exists
+        existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+        current_date = datetime.utcnow().strftime('%Y-%m-%d')
+        
+        # Prepare the record data with all analyze metrics
+        record_data = {
+            'Subreddit': subreddit_name,
+            'Subscribers': analysis_data.get('subscribers', 0),
+            'Effectiveness_Score': analysis_data.get('effectiveness_score', 0),
+            'Avg_Posts_Per_Day': analysis_data.get('avg_posts_per_day', 0),
+            'Avg_Score_Per_Post': analysis_data.get('avg_score_per_post', 0),
+            'Avg_Comments_Per_Post': analysis_data.get('avg_comments_per_post', 0),
+            'Days_Analyzed': analysis_data.get('days_analyzed', 7),
+            'Last_Analyzed': current_date
+        }
+        
+        # Add top post data if available
+        if analysis_data.get('top_post'):
+            top_post = analysis_data['top_post']
+            record_data.update({
+                'Top_Post_Title': top_post.get('title', '')[:500],  # Limit length
+                'Top_Post_Score': top_post.get('score', 0),
+                'Top_Post_Author': top_post.get('author', ''),
+                'Top_Post_Comments': top_post.get('comments', 0),
+                'Top_Post_URL': top_post.get('url', ''),
+                'Top_Post_Flair': top_post.get('flair', '')
+            })
+        
+        # Add posting times data if available (SIMPLIFIED - only best hour and day)
+        if analysis_data.get('posting_times'):
+            posting_times = analysis_data['posting_times']
             
-            # Check if record exists
-            existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
-            current_date = datetime.utcnow().strftime('%Y-%m-%d')
+            # Best hour (just the #1)
+            if posting_times.get('best_hours') and len(posting_times['best_hours']) > 0:
+                best_hour = posting_times['best_hours'][0]
+                record_data['Best_Hour'] = best_hour.get('hour', -1)
+                record_data['Best_Hour_Score'] = best_hour.get('avg_score', 0)
             
-            # Prepare the record data with all analyze metrics
-            record_data = {
-                'Subreddit': subreddit_name,
-                'Subscribers': analysis_data.get('subscribers', 0),
-                'Effectiveness_Score': analysis_data.get('effectiveness_score', 0),
-                'Avg_Posts_Per_Day': analysis_data.get('avg_posts_per_day', 0),
-                'Avg_Score_Per_Post': analysis_data.get('avg_score_per_post', 0),
-                'Avg_Comments_Per_Post': analysis_data.get('avg_comments_per_post', 0),
-                'Days_Analyzed': analysis_data.get('days_analyzed', 7),
-                'Last_Analyzed': current_date
-            }
+            # Best day (just the #1)
+            if posting_times.get('best_days') and len(posting_times['best_days']) > 0:
+                best_day = posting_times['best_days'][0]
+                record_data['Best_Day'] = best_day.get('day', '')
             
-            # Add top post data if available
-            if analysis_data.get('top_post'):
-                top_post = analysis_data['top_post']
-                record_data.update({
-                    'Top_Post_Title': top_post.get('title', '')[:500],  # Limit length
-                    'Top_Post_Score': top_post.get('score', 0),
-                    'Top_Post_Author': top_post.get('author', ''),
-                    'Top_Post_Comments': top_post.get('comments', 0),
-                    'Top_Post_URL': top_post.get('url', ''),
-                    'Top_Post_Flair': top_post.get('flair', '')
-                })
+            record_data['Posts_Analyzed_For_Timing'] = posting_times.get('posts_analyzed', 0)
+        
+        # Update existing record or create new one
+        if existing:
+            # Keep existing karma requirements data
+            existing_data = existing[0]['fields']
             
-            # Add posting times data if available
-            if analysis_data.get('posting_times'):
-                posting_times = analysis_data['posting_times']
-                
-                # Best hours (top 3)
-                if posting_times.get('best_hours'):
-                    best_hours = posting_times['best_hours'][:3]
-                    for i, hour_data in enumerate(best_hours):
-                        record_data[f'Best_Hour_{i+1}'] = hour_data.get('hour', -1)
-                        record_data[f'Best_Hour_{i+1}_Score'] = hour_data.get('avg_score', 0)
-                        record_data[f'Best_Hour_{i+1}_Comments'] = hour_data.get('avg_comments', 0)
-                        record_data[f'Best_Hour_{i+1}_Competition'] = hour_data.get('competition', '')
-                
-                # Best days (top 3)
-                if posting_times.get('best_days'):
-                    best_days = posting_times['best_days'][:3]
-                    for i, day_data in enumerate(best_days):
-                        record_data[f'Best_Day_{i+1}'] = day_data.get('day', '')
-                        record_data[f'Best_Day_{i+1}_Score'] = day_data.get('avg_score', 0)
-                
-                record_data['Posts_Analyzed_For_Timing'] = posting_times.get('posts_analyzed', 0)
+            # Preserve karma requirements fields if they exist
+            karma_fields = [
+                'Post_Karma_Min', 'Comment_Karma_Min', 'Account_Age_Days',
+                'Confidence', 'Requires_Verification', 'Verification_Method',
+                'Verification_Optional', 'Verification_Note', 'Posts_Analyzed'
+            ]
             
-            # Update existing record or create new one
-            if existing:
-                # Keep existing karma requirements data
-                existing_data = existing[0]['fields']
-                
-                # Preserve karma requirements fields if they exist
-                karma_fields = [
-                    'Post_Karma_Min', 'Comment_Karma_Min', 'Account_Age_Days',
-                    'Confidence', 'Requires_Verification', 'Verification_Method',
-                    'Verification_Optional', 'Verification_Note', 'Posts_Analyzed'
-                ]
-                
-                for field in karma_fields:
-                    if field in existing_data:
-                        record_data[field] = existing_data[field]
-                
-                # Update the record
-                updated = self.karma_table.update(existing[0]['id'], record_data)
-                logging.info(f"Updated Airtable record for {subreddit_name}: {updated['id']}")
-            else:
-                # Create new record
-                created = self.karma_table.create(record_data)
-                logging.info(f"Created Airtable record for {subreddit_name}: {created['id']}")
+            for field in karma_fields:
+                if field in existing_data:
+                    record_data[field] = existing_data[field]
             
-            return True
-            
-        except Exception as e:
-            logging.error(f"Failed to save analyze data to Airtable for {subreddit_name}: {e}")
-            return False
+            # Update the record
+            updated = self.karma_table.update(existing[0]['id'], record_data)
+            logging.info(f"Updated Airtable record for {subreddit_name}: {updated['id']}")
+        else:
+            # Create new record
+            created = self.karma_table.create(record_data)
+            logging.info(f"Created Airtable record for {subreddit_name}: {created['id']}")
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to save analyze data to Airtable for {subreddit_name}: {e}")
+        return False
     
     def analyze_posting_times(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """Analyze best posting times for a subreddit"""
