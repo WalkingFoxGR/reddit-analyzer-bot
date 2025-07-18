@@ -213,7 +213,7 @@ class RedditAnalyzer:
                 'error': str(e)
             }
     
-    def check_verification_requirements(self, subreddit_name: str) -> Dict[str, Any]:
+def check_verification_requirements(self, subreddit_name: str) -> Dict[str, Any]:
     """Enhanced verification detection - checks rules AND recent policy changes"""
     try:
         subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
