@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, Response
 import praw
+from prawcore.exceptions import RequestException, ResponseException
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -13,6 +14,20 @@ import queue
 import pytz
 from pyairtable import Api
 import statistics
+
+# Add this function BEFORE the Flask app initialization
+def safe_reddit_call(func, max_retries=3):
+    """Wrapper to retry Reddit API calls"""
+    for i in range(max_retries):
+        try:
+            return func()
+        except (RequestException, ResponseException) as e:
+            if i < max_retries - 1:
+                wait_time = 2 ** i  # Exponential backoff: 1, 2, 4 seconds
+                logging.warning(f"Reddit API error, retrying in {wait_time}s: {e}")
+                time.sleep(wait_time)
+            else:
+                raise
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +48,8 @@ class RedditAnalyzer:
             client_id=REDDIT_CLIENT_ID,
             client_secret=REDDIT_CLIENT_SECRET,
             user_agent=REDDIT_USER_AGENT,
-            ratelimit_seconds=300
+            ratelimit_seconds=300,
+            timeout=30  # Added timeout
         )
         
         # Cache for analysis results
@@ -86,7 +102,7 @@ class RedditAnalyzer:
     def analyze_posting_times(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """Analyze best posting times for a subreddit"""
         try:
-            subreddit = self.reddit.subreddit(subreddit_name)
+            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
             # Data structures for time analysis
             hourly_scores = defaultdict(list)
@@ -187,6 +203,214 @@ class RedditAnalyzer:
                 'error': str(e)
             }
     
+    def analyze_karma_requirements(self, subreddit_name: str) -> Dict[str, Any]:
+        """Analyze karma requirements with caching"""
+        
+        # Check Airtable cache first
+        if self.airtable:
+            try:
+                records = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+                if records:
+                    record = records[0]['fields']
+                    last_updated = datetime.fromisoformat(record.get('Last_Updated', '2000-01-01'))
+                    if (datetime.utcnow() - last_updated).days < 30:  # 30-day cache
+                        return {
+                            'success': True,
+                            'from_cache': True,
+                            'post_karma_min': record.get('Post_Karma_Min', 0),
+                            'comment_karma_min': record.get('Comment_Karma_Min', 0),
+                            'account_age_days': record.get('Account_Age_Days', 0),
+                            'confidence': record.get('Confidence', 'Unknown'),
+                            'requires_verification': record.get('Requires_Verification', False)
+                        }
+            except Exception as e:
+                logging.warning(f"Airtable cache read failed: {e}")
+        
+        # Analyze if not cached
+        try:
+            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            min_post_karma = float('inf')
+            min_comment_karma = float('inf')
+            min_account_age = float('inf')
+            
+            users_analyzed = set()
+            verified_users = 0
+            total_users = 0
+            
+            # Check recent posts
+            for post in subreddit.new(limit=50):
+                try:
+                    if not post.author or post.author.name in users_analyzed:
+                        continue
+                    
+                    users_analyzed.add(post.author.name)
+                    user = safe_reddit_call(lambda: self.reddit.redditor(post.author.name))
+                    
+                    # Track minimums
+                    if user.link_karma < min_post_karma:
+                        min_post_karma = user.link_karma
+                    if user.comment_karma < min_comment_karma:
+                        min_comment_karma = user.comment_karma
+                        
+                    account_age = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
+                    if account_age < min_account_age:
+                        min_account_age = account_age
+                    
+                    # Check for verified status (if they have special flair)
+                    if hasattr(post, 'author_flair_text') and post.author_flair_text:
+                        if 'verified' in str(post.author_flair_text).lower():
+                            verified_users += 1
+                    total_users += 1
+                    
+                    if len(users_analyzed) % 10 == 0:
+                        time.sleep(0.3)
+                        
+                except Exception as e:
+                    continue
+            
+            # Check recent comments for comment karma requirements
+            comment_users = set()
+            for comment in subreddit.comments(limit=30):
+                try:
+                    if not comment.author or comment.author.name in comment_users:
+                        continue
+                        
+                    comment_users.add(comment.author.name)
+                    user = safe_reddit_call(lambda: self.reddit.redditor(comment.author.name))
+                    
+                    if user.comment_karma < min_comment_karma:
+                        min_comment_karma = user.comment_karma
+                        
+                except Exception:
+                    continue
+            
+            # Calculate confidence
+            if min_post_karma > 100 or min_comment_karma > 100:
+                confidence = 'High'
+            elif min_post_karma > 10 or min_comment_karma > 10:
+                confidence = 'Medium'
+            else:
+                confidence = 'Low'
+            
+            # Check verification requirement
+            requires_verification = (verified_users / total_users > 0.5) if total_users > 0 else False
+            
+            result = {
+                'success': True,
+                'from_cache': False,
+                'post_karma_min': max(0, min_post_karma - 1) if min_post_karma != float('inf') else 0,
+                'comment_karma_min': max(0, min_comment_karma - 1) if min_comment_karma != float('inf') else 0,
+                'account_age_days': max(0, min_account_age - 1) if min_account_age != float('inf') else 0,
+                'confidence': confidence,
+                'requires_verification': requires_verification,
+                'users_analyzed': len(users_analyzed)
+            }
+            
+            # Cache in Airtable
+            if self.airtable and not result['from_cache']:
+                try:
+                    # Check if record exists
+                    existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+                    
+                    record_data = {
+                        'Subreddit': subreddit_name,
+                        'Post_Karma_Min': result['post_karma_min'],
+                        'Comment_Karma_Min': result['comment_karma_min'],
+                        'Account_Age_Days': result['account_age_days'],
+                        'Confidence': result['confidence'],
+                        'Requires_Verification': result['requires_verification'],
+                        'Last_Updated': datetime.utcnow().isoformat()
+                    }
+                    
+                    if existing:
+                        self.karma_table.update(existing[0]['id'], record_data)
+                    else:
+                        self.karma_table.create(record_data)
+                        
+                except Exception as e:
+                    logging.warning(f"Airtable cache write failed: {e}")
+            
+            return result
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def detect_fake_upvotes(self, subreddit_name: str) -> Dict[str, Any]:
+        """Detect potential fake upvote patterns"""
+        try:
+            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            # Collect post data
+            post_scores = []
+            user_post_scores = defaultdict(list)
+            suspicious_posts = []
+            
+            for post in subreddit.new(limit=200):
+                try:
+                    score = post.score
+                    post_scores.append(score)
+                    
+                    if post.author:
+                        user_post_scores[post.author.name].append({
+                            'score': score,
+                            'title': post.title[:100],
+                            'created': post.created_utc,
+                            'url': f"https://reddit.com{post.permalink}"
+                        })
+                        
+                except Exception:
+                    continue
+            
+            # Calculate subreddit average
+            if len(post_scores) > 10:
+                median_score = statistics.median(post_scores)
+                mean_score = statistics.mean(post_scores)
+                
+                # Check for suspicious patterns
+                for username, posts in user_post_scores.items():
+                    if len(posts) >= 2:
+                        user_scores = [p['score'] for p in posts]
+                        user_median = statistics.median(user_scores)
+                        
+                        # Check for suspicious spikes
+                        for post in posts:
+                            if post['score'] > max(median_score * 5, 100):
+                                if post['score'] > user_median * 10:
+                                    suspicious_posts.append({
+                                        'author': username,
+                                        'score': post['score'],
+                                        'expected_range': f"{int(median_score * 0.5)}-{int(median_score * 2)}",
+                                        'spike_ratio': round(post['score'] / median_score, 1),
+                                        'title': post['title'],
+                                        'url': post['url']
+                                    })
+            
+            has_fake_upvotes = len(suspicious_posts) > 0
+            
+            # Update Airtable if exists
+            if self.airtable and has_fake_upvotes:
+                try:
+                    existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+                    if existing:
+                        self.karma_table.update(existing[0]['id'], {
+                            'Has_Fake_Upvotes': has_fake_upvotes,
+                            'Analysis_Data': json.dumps(suspicious_posts[:5])  # Store top 5
+                        })
+                except Exception:
+                    pass
+            
+            return {
+                'success': True,
+                'has_suspicious_activity': has_fake_upvotes,
+                'median_score': median_score if 'median_score' in locals() else 0,
+                'suspicious_posts': suspicious_posts[:3],  # Return top 3
+                'confidence': 'High' if len(suspicious_posts) > 5 else 'Medium' if len(suspicious_posts) > 0 else 'Low'
+            }
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
     def find_related_subreddits_progressive(self, seed_subreddit: str, max_users: int = 100,
                                           progress_callback=None) -> Dict[str, Any]:
         """Progressive analysis of related subreddits with real-time updates"""
@@ -197,7 +421,7 @@ class RedditAnalyzer:
             
             # Get the seed subreddit
             try:
-                subreddit = self.reddit.subreddit(seed_subreddit)
+                subreddit = safe_reddit_call(lambda: self.reddit.subreddit(seed_subreddit))
                 seed_info = {
                     'name': subreddit.display_name,
                     'subscribers': subreddit.subscribers
@@ -240,7 +464,7 @@ class RedditAnalyzer:
                 users_analyzed.add(username)
                 
                 try:
-                    user = self.reddit.redditor(username)
+                    user = safe_reddit_call(lambda: self.reddit.redditor(username))
                     
                     # Analyze user's recent activity
                     user_subs = set()
@@ -282,7 +506,7 @@ class RedditAnalyzer:
             detailed_results = []
             for sub_name, overlap_score in sorted_subs:
                 try:
-                    sub = self.reddit.subreddit(sub_name)
+                    sub = safe_reddit_call(lambda: self.reddit.subreddit(sub_name))
                     
                     # Calculate user overlap percentage
                     users_in_both = sum(1 for user_subs in user_subreddits.values() if sub_name in user_subs)
@@ -317,7 +541,7 @@ class RedditAnalyzer:
             }
     
     def analyze_subreddit_with_timing(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
-        """Enhanced subreddit analysis including best posting times"""
+        """Enhanced subreddit analysis including best posting times AND restrictions"""
         try:
             # Get basic analysis
             basic_analysis = self.analyze_subreddit(subreddit_name, days)
@@ -327,9 +551,16 @@ class RedditAnalyzer:
             
             # Add timing analysis
             timing_analysis = self.analyze_posting_times(subreddit_name, days)
-            
-            # Combine results
             basic_analysis['posting_times'] = timing_analysis
+            
+            # ADD RESTRICTIONS ANALYSIS
+            karma_req = self.analyze_karma_requirements(subreddit_name)
+            fake_upvotes = self.detect_fake_upvotes(subreddit_name)
+            
+            basic_analysis['restrictions'] = {
+                'karma_requirements': karma_req,
+                'fake_upvote_detection': fake_upvotes
+            }
             
             # Format best times message
             if timing_analysis['best_hours']:
@@ -369,7 +600,7 @@ class RedditAnalyzer:
     def analyze_subreddit(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """Enhanced subreddit analysis with top post information"""
         try:
-            subreddit = self.reddit.subreddit(subreddit_name)
+            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             subscribers = subreddit.subscribers
             date_threshold = datetime.utcnow() - timedelta(days=days)
             
@@ -454,256 +685,163 @@ class RedditAnalyzer:
             logging.error(f"Error analyzing subreddit {subreddit_name}: {e}")
             return {'success': False, 'error': str(e)}
     
+    def analyze_user(self, username: str, days: int = 30, limit: int = 100) -> Dict[str, Any]:
+        """Analyze a Reddit user's posting activity and performance"""
+        try:
+            user = safe_reddit_call(lambda: self.reddit.redditor(username))
+            
+            # Get basic user info
+            try:
+                user_info = {
+                    'username': user.name,
+                    'total_karma': user.total_karma,
+                    'link_karma': user.link_karma,
+                    'comment_karma': user.comment_karma,
+                    'account_created': datetime.utcfromtimestamp(user.created_utc).isoformat(),
+                    'account_age_days': (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days,
+                    'is_verified': user.verified if hasattr(user, 'verified') else False,
+                    'has_premium': user.is_gold if hasattr(user, 'is_gold') else False
+                }
+            except Exception as e:
+                logging.warning(f"Error getting user info: {e}")
+                user_info = {'username': username, 'error': 'User info not accessible'}
+            
+            # Analyze recent submissions
+            date_threshold = datetime.utcnow() - timedelta(days=days)
+            submissions = []
+            subreddit_stats = defaultdict(lambda: {'count': 0, 'total_score': 0, 'total_comments': 0})
+            
+            total_score = 0
+            total_comments = 0
+            submission_count = 0
+            
+            # Track top posts
+            top_posts = []
+            
+            try:
+                for submission in user.submissions.new(limit=limit):
+                    submission_date = datetime.utcfromtimestamp(submission.created_utc)
+                    
+                    if submission_date < date_threshold:
+                        continue
+                    
+                    submission_data = {
+                        'title': submission.title,
+                        'subreddit': submission.subreddit.display_name,
+                        'score': submission.score,
+                        'comments': submission.num_comments,
+                        'upvote_ratio': submission.upvote_ratio,
+                        'url': f"https://reddit.com{submission.permalink}",
+                        'created_utc': submission_date.isoformat(),
+                        'flair': submission.link_flair_text or 'No Flair',
+                        'is_self': submission.is_self,
+                        'is_nsfw': submission.over_18,
+                        'is_spoiler': submission.spoiler,
+                        'num_crossposts': submission.num_crossposts
+                    }
+                    
+                    submissions.append(submission_data)
+                    
+                    # Update subreddit statistics
+                    subreddit_name = submission.subreddit.display_name
+                    subreddit_stats[subreddit_name]['count'] += 1
+                    subreddit_stats[subreddit_name]['total_score'] += submission.score
+                    subreddit_stats[subreddit_name]['total_comments'] += submission.num_comments
+                    
+                    # Track totals
+                    total_score += submission.score
+                    total_comments += submission.num_comments
+                    submission_count += 1
+                    
+                    # Add to top posts if it's good enough
+                    top_posts.append(submission_data)
+                    
+                    # Rate limiting
+                    if submission_count % 20 == 0:
+                        time.sleep(0.3)
+                        
+            except Exception as e:
+                logging.warning(f"Error analyzing user submissions: {e}")
+            
+            # Sort submissions by score
+            submissions.sort(key=lambda x: x['score'], reverse=True)
+            top_posts.sort(key=lambda x: x['score'], reverse=True)
+            
+            # Calculate averages
+            avg_score_per_post = total_score / submission_count if submission_count > 0 else 0
+            avg_comments_per_post = total_comments / submission_count if submission_count > 0 else 0
+            posts_per_day = submission_count / days
+            
+            # Process subreddit statistics
+            subreddit_performance = []
+            for subreddit, stats in subreddit_stats.items():
+                if stats['count'] > 0:
+                    subreddit_performance.append({
+                        'subreddit': subreddit,
+                        'post_count': stats['count'],
+                        'total_score': stats['total_score'],
+                        'total_comments': stats['total_comments'],
+                        'avg_score': round(stats['total_score'] / stats['count'], 2),
+                        'avg_comments': round(stats['total_comments'] / stats['count'], 2)
+                    })
+            
+            # Sort subreddits by total score
+            subreddit_performance.sort(key=lambda x: x['total_score'], reverse=True)
+            
+            # Analyze comment activity
+            comment_count = 0
+            comment_score = 0
+            try:
+                for comment in user.comments.new(limit=100):
+                    comment_date = datetime.utcfromtimestamp(comment.created_utc)
+                    if comment_date >= date_threshold:
+                        comment_count += 1
+                        comment_score += comment.score
+                        
+                        if comment_count % 25 == 0:
+                            time.sleep(0.2)
+            except Exception as e:
+                logging.warning(f"Error analyzing comments: {e}")
+            
+            avg_comment_score = comment_score / comment_count if comment_count > 0 else 0
+            
+            return {
+                'success': True,
+                'username': username,
+                'user_info': user_info,
+                'analysis_period': {
+                    'days': days,
+                    'from_date': date_threshold.isoformat(),
+                    'to_date': datetime.utcnow().isoformat()
+                },
+                'submission_stats': {
+                    'total_submissions': submission_count,
+                    'total_score': total_score,
+                    'total_comments': total_comments,
+                    'avg_score_per_post': round(avg_score_per_post, 2),
+                    'avg_comments_per_post': round(avg_comments_per_post, 2),
+                    'posts_per_day': round(posts_per_day, 2)
+                },
+                'comment_stats': {
+                    'total_comments': comment_count,
+                    'total_comment_score': comment_score,
+                    'avg_comment_score': round(avg_comment_score, 2)
+                },
+                'top_posts': top_posts[:10],  # Top 10 posts
+                'recent_posts': submissions[:20],  # 20 most recent posts
+                'subreddit_performance': subreddit_performance[:15],  # Top 15 subreddits
+                'analyzed_at': datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logging.error(f"Error analyzing user {username}: {e}")
+            return {'success': False, 'error': str(e)}
+    
     def parse_compare_input(self, input_text: str) -> List[str]:
         """Parse flexible compare input formats"""
         cleaned = re.sub(r'\s+', ' ', input_text.strip())
         subreddits = re.split(r'[,\s]+', cleaned)
         return [sub.strip() for sub in subreddits if sub.strip()]
-
-def analyze_karma_requirements(self, subreddit_name: str) -> Dict[str, Any]:
-    """Analyze karma requirements with caching"""
-    
-    # Check Airtable cache first
-    if self.airtable:
-        try:
-            records = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
-            if records:
-                record = records[0]['fields']
-                last_updated = datetime.fromisoformat(record.get('Last_Updated', '2000-01-01'))
-                if (datetime.utcnow() - last_updated).days < 30:  # 30-day cache
-                    return {
-                        'success': True,
-                        'from_cache': True,
-                        'post_karma_min': record.get('Post_Karma_Min', 0),
-                        'comment_karma_min': record.get('Comment_Karma_Min', 0),
-                        'account_age_days': record.get('Account_Age_Days', 0),
-                        'confidence': record.get('Confidence', 'Unknown'),
-                        'requires_verification': record.get('Requires_Verification', False)
-                    }
-        except Exception as e:
-            logging.warning(f"Airtable cache read failed: {e}")
-    
-    # Analyze if not cached
-    try:
-        subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
-        
-        min_post_karma = float('inf')
-        min_comment_karma = float('inf')
-        min_account_age = float('inf')
-        
-        users_analyzed = set()
-        verified_users = 0
-        total_users = 0
-        
-        # Check recent posts
-        for post in subreddit.new(limit=50):
-            try:
-                if not post.author or post.author.name in users_analyzed:
-                    continue
-                
-                users_analyzed.add(post.author.name)
-                user = safe_reddit_call(lambda: self.reddit.redditor(post.author.name))
-                
-                # Track minimums
-                if user.link_karma < min_post_karma:
-                    min_post_karma = user.link_karma
-                if user.comment_karma < min_comment_karma:
-                    min_comment_karma = user.comment_karma
-                    
-                account_age = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
-                if account_age < min_account_age:
-                    min_account_age = account_age
-                
-                # Check for verified status (if they have special flair)
-                if hasattr(post, 'author_flair_text') and post.author_flair_text:
-                    if 'verified' in str(post.author_flair_text).lower():
-                        verified_users += 1
-                total_users += 1
-                
-                if len(users_analyzed) % 10 == 0:
-                    time.sleep(0.3)
-                    
-            except Exception as e:
-                continue
-        
-        # Check recent comments for comment karma requirements
-        comment_users = set()
-        for comment in subreddit.comments(limit=30):
-            try:
-                if not comment.author or comment.author.name in comment_users:
-                    continue
-                    
-                comment_users.add(comment.author.name)
-                user = safe_reddit_call(lambda: self.reddit.redditor(comment.author.name))
-                
-                if user.comment_karma < min_comment_karma:
-                    min_comment_karma = user.comment_karma
-                    
-            except Exception:
-                continue
-        
-        # Calculate confidence
-        if min_post_karma > 100 or min_comment_karma > 100:
-            confidence = 'High'
-        elif min_post_karma > 10 or min_comment_karma > 10:
-            confidence = 'Medium'
-        else:
-            confidence = 'Low'
-        
-        # Check verification requirement
-        requires_verification = (verified_users / total_users > 0.5) if total_users > 0 else False
-        
-        result = {
-            'success': True,
-            'from_cache': False,
-            'post_karma_min': max(0, min_post_karma - 1) if min_post_karma != float('inf') else 0,
-            'comment_karma_min': max(0, min_comment_karma - 1) if min_comment_karma != float('inf') else 0,
-            'account_age_days': max(0, min_account_age - 1) if min_account_age != float('inf') else 0,
-            'confidence': confidence,
-            'requires_verification': requires_verification,
-            'users_analyzed': len(users_analyzed)
-        }
-        
-        # Cache in Airtable
-        if self.airtable and not result['from_cache']:
-            try:
-                # Check if record exists
-                existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
-                
-                record_data = {
-                    'Subreddit': subreddit_name,
-                    'Post_Karma_Min': result['post_karma_min'],
-                    'Comment_Karma_Min': result['comment_karma_min'],
-                    'Account_Age_Days': result['account_age_days'],
-                    'Confidence': result['confidence'],
-                    'Requires_Verification': result['requires_verification'],
-                    'Last_Updated': datetime.utcnow().isoformat()
-                }
-                
-                if existing:
-                    self.karma_table.update(existing[0]['id'], record_data)
-                else:
-                    self.karma_table.create(record_data)
-                    
-            except Exception as e:
-                logging.warning(f"Airtable cache write failed: {e}")
-        
-        return result
-        
-    except Exception as e:
-        return {'success': False, 'error': str(e)}
-
-def detect_fake_upvotes(self, subreddit_name: str) -> Dict[str, Any]:
-    """Detect potential fake upvote patterns"""
-    try:
-        subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
-        
-        # Collect post data
-        post_scores = []
-        user_post_scores = defaultdict(list)
-        suspicious_posts = []
-        
-        for post in subreddit.new(limit=200):
-            try:
-                score = post.score
-                post_scores.append(score)
-                
-                if post.author:
-                    user_post_scores[post.author.name].append({
-                        'score': score,
-                        'title': post.title[:100],
-                        'created': post.created_utc,
-                        'url': f"https://reddit.com{post.permalink}"
-                    })
-                    
-            except Exception:
-                continue
-        
-        # Calculate subreddit average
-        if len(post_scores) > 10:
-            median_score = statistics.median(post_scores)
-            mean_score = statistics.mean(post_scores)
-            
-            # Check for suspicious patterns
-            for username, posts in user_post_scores.items():
-                if len(posts) >= 2:
-                    user_scores = [p['score'] for p in posts]
-                    user_median = statistics.median(user_scores)
-                    
-                    # Check for suspicious spikes
-                    for post in posts:
-                        if post['score'] > max(median_score * 5, 100):
-                            if post['score'] > user_median * 10:
-                                suspicious_posts.append({
-                                    'author': username,
-                                    'score': post['score'],
-                                    'expected_range': f"{int(median_score * 0.5)}-{int(median_score * 2)}",
-                                    'spike_ratio': round(post['score'] / median_score, 1),
-                                    'title': post['title'],
-                                    'url': post['url']
-                                })
-        
-        has_fake_upvotes = len(suspicious_posts) > 0
-        
-        # Update Airtable if exists
-        if self.airtable and has_fake_upvotes:
-            try:
-                existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
-                if existing:
-                    self.karma_table.update(existing[0]['id'], {
-                        'Has_Fake_Upvotes': has_fake_upvotes,
-                        'Analysis_Data': json.dumps(suspicious_posts[:5])  # Store top 5
-                    })
-            except Exception:
-                pass
-        
-        return {
-            'success': True,
-            'has_suspicious_activity': has_fake_upvotes,
-            'median_score': median_score if 'median_score' in locals() else 0,
-            'suspicious_posts': suspicious_posts[:3],  # Return top 3
-            'confidence': 'High' if len(suspicious_posts) > 5 else 'Medium' if len(suspicious_posts) > 0 else 'Low'
-        }
-        
-    except Exception as e:
-        return {'success': False, 'error': str(e)}
-
-# Update analyze_subreddit_with_timing to send progressive updates:
-def analyze_subreddit_with_timing_progressive(self, subreddit_name: str, days: int = 7, 
-                                             progress_callback=None) -> Dict[str, Any]:
-    """Enhanced analysis with progressive updates"""
-    
-    # Get basic analysis first
-    basic_analysis = self.analyze_subreddit_with_timing(subreddit_name, days)
-    
-    if not basic_analysis['success']:
-        return basic_analysis
-    
-    # Send initial results if callback provided
-    if progress_callback:
-        progress_callback({
-            'stage': 'basic_complete',
-            'data': basic_analysis
-        })
-    
-    # Add restrictions analysis
-    karma_req = self.analyze_karma_requirements(subreddit_name)
-    fake_upvotes = self.detect_fake_upvotes(subreddit_name)
-    
-    # Add to results
-    basic_analysis['restrictions'] = {
-        'karma_requirements': karma_req,
-        'fake_upvote_detection': fake_upvotes
-    }
-    
-    # Send final results
-    if progress_callback:
-        progress_callback({
-            'stage': 'complete',
-            'data': basic_analysis
-        })
-    
-    return basic_analysis
 
 # Initialize analyzer
 analyzer = RedditAnalyzer()
@@ -714,12 +852,12 @@ analysis_sessions = {}
 def validate_subreddit(subreddit_name: str) -> Dict[str, Any]:
     """Validate if a subreddit exists and is accessible"""
     try:
-        subreddit = analyzer.reddit.subreddit(subreddit_name)
+        subreddit = safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
         # Try to access a basic attribute to trigger the API call
-        _ = subreddit.display_name
+        _ = safe_reddit_call(lambda: subreddit.display_name)
         # Check if it's private/banned by trying to access subscribers
         try:
-            subscribers = subreddit.subscribers
+            subscribers = safe_reddit_call(lambda: subreddit.subscribers)
             if subscribers is None:
                 return {
                     'valid': False,
@@ -780,6 +918,61 @@ def analyze_endpoint():
         }), 400
     
     result = analyzer.analyze_subreddit_with_timing(subreddit, days)
+    return jsonify(result)
+
+@app.route('/analyze-user', methods=['POST'])
+def analyze_user_endpoint():
+    """Analyze a Reddit user's posting activity and performance"""
+    data = request.json
+    username = data.get('username')
+    days = data.get('days', 30)
+    limit = data.get('limit', 100)
+    
+    if not username:
+        return jsonify({'success': False, 'error': 'No username provided'}), 400
+    
+    # Remove u/ prefix if present
+    username = username.replace('u/', '').replace('/u/', '')
+    
+    # Validate user exists
+    try:
+        user = safe_reddit_call(lambda: analyzer.reddit.redditor(username))
+        # Try to access a basic attribute to check if user exists
+        _ = safe_reddit_call(lambda: user.name)
+        
+        # Check if user is suspended/banned
+        try:
+            _ = safe_reddit_call(lambda: user.created_utc)
+        except Exception as e:
+            if 'suspended' in str(e).lower() or 'banned' in str(e).lower():
+                return jsonify({
+                    'success': False,
+                    'error': f'User u/{username} is suspended or banned',
+                    'error_type': 'suspended'
+                }), 400
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': f'Cannot access user u/{username}: {str(e)}',
+                    'error_type': 'access_denied'
+                }), 400
+                
+    except Exception as e:
+        error_str = str(e).lower()
+        if 'not found' in error_str or 'redirect' in error_str:
+            return jsonify({
+                'success': False,
+                'error': f'User u/{username} does not exist',
+                'error_type': 'not_found'
+            }), 400
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Error accessing user u/{username}: {str(e)}',
+                'error_type': 'unknown'
+            }), 400
+    
+    result = analyzer.analyze_user(username, days, limit)
     return jsonify(result)
 
 @app.route('/analyze-multiple', methods=['POST'])
@@ -1032,7 +1225,7 @@ def scrape_posts():
         return jsonify({'success': False, 'error': f'Invalid time filter. Use: {", ".join(valid_time_filters)}'}), 400
     
     try:
-        subreddit = analyzer.reddit.subreddit(subreddit_name)
+        subreddit = safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
         posts = []
         
         # Get posts based on sort type
@@ -1107,7 +1300,7 @@ def get_subreddit_rules():
         }), 400
     
     try:
-        subreddit = analyzer.reddit.subreddit(subreddit_name)
+        subreddit = safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
         rules = []
         
         for rule in subreddit.rules:
@@ -1123,7 +1316,8 @@ def get_subreddit_rules():
             'subreddit': subreddit_name,
             'rules': rules,
             'submission_text': subreddit.submit_text or 'No submission guidelines',
-            'subscribers': subreddit.subscribers
+            'subscribers': subreddit.subscribers,
+            'public_description': subreddit.public_description or 'No description'
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1146,7 +1340,7 @@ def analyze_flairs():
         }), 400
     
     try:
-        subreddit = analyzer.reddit.subreddit(subreddit_name)
+        subreddit = safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
         flair_stats = {}
         
         for post in subreddit.hot(limit=100):
@@ -1181,6 +1375,7 @@ def analyze_flairs():
             'subreddit': subreddit_name,
             'flair_analysis': flair_analysis,
             'subscribers': subreddit.subscribers,
+            'public_description': subreddit.public_description or 'No description',
             'analyzed_posts': sum(stats['count'] for stats in flair_stats.values())
         })
     except Exception as e:
