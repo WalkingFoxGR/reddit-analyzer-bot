@@ -308,28 +308,32 @@ class RedditAnalyzer:
             }
             
             # Cache in Airtable
-            if self.airtable and not result['from_cache']:
-                try:
-                    # Check if record exists
-                    existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
-                    
-                    record_data = {
-                        'Subreddit': subreddit_name,
-                        'Post_Karma_Min': result['post_karma_min'],
-                        'Comment_Karma_Min': result['comment_karma_min'],
-                        'Account_Age_Days': result['account_age_days'],
-                        'Confidence': result['confidence'],
-                        'Requires_Verification': result['requires_verification'],
-                        'Last_Updated': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
-                     }
-                    
-                    if existing:
-                        self.karma_table.update(existing[0]['id'], record_data)
-                    else:
-                        self.karma_table.create(record_data)
-                        
-                except Exception as e:
-                    logging.warning(f"Airtable cache write failed: {e}")
+# Cache in Airtable
+if self.airtable and not result['from_cache']:
+    try:
+        # Check if record exists
+        existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+        
+        # Use simple date format that Airtable likes
+        current_date = datetime.utcnow().strftime('%Y-%m-%d')
+        
+        record_data = {
+            'Subreddit': subreddit_name,
+            'Post_Karma_Min': result['post_karma_min'],
+            'Comment_Karma_Min': result['comment_karma_min'],
+            'Account_Age_Days': result['account_age_days'],
+            'Confidence': result['confidence'],
+            'Requires_Verification': result['requires_verification'],
+            'Last_Updated': current_date  # ← Simple date format
+        }
+        
+        if existing:
+            self.karma_table.update(existing[0]['id'], record_data)
+        else:
+            self.karma_table.create(record_data)
+            
+    except Exception as e:
+        logging.warning(f"Airtable cache write failed: {e}")
             
             return result
             
