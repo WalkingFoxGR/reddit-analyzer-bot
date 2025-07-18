@@ -40,9 +40,19 @@ REDDIT_USER_AGENT = os.getenv('REDDIT_USER_AGENT', 'RedditAnalyzer/1.0')
 class RedditAnalyzer:
     def __init__(self):
         self.airtable = None
-        if os.getenv('AIRTABLE_API_KEY') and os.getenv('AIRTABLE_BASE_ID'):
-            self.airtable = Api(os.getenv('AIRTABLE_API_KEY'))
-            self.karma_table = self.airtable.table(os.getenv('AIRTABLE_BASE_ID'), 'Karma Requirements')
+        api_key = os.getenv('AIRTABLE_API_KEY')
+        base_id = os.getenv('AIRTABLE_BASE_ID')
+        
+        if api_key and base_id:
+            try:
+                self.airtable = Api(api_key)
+                self.karma_table = self.airtable.table(base_id, 'Karma Requirements')
+                logging.info("Airtable initialized successfully")
+            except Exception as e:
+                logging.error(f"Failed to initialize Airtable: {e}")
+                self.airtable = None
+        else:
+            logging.warning("Airtable credentials not found - running without caching")
         
         self.reddit = praw.Reddit(
             client_id=REDDIT_CLIENT_ID,
@@ -204,7 +214,7 @@ class RedditAnalyzer:
             }
     
     def analyze_karma_requirements(self, subreddit_name: str) -> Dict[str, Any]:
-        """Analyze karma requirements with caching"""
+        """Analyze karma requirements with caching - INCREASED POSTS"""
         
         # Check Airtable cache first
         if self.airtable:
@@ -226,7 +236,7 @@ class RedditAnalyzer:
             except Exception as e:
                 logging.warning(f"Airtable cache read failed: {e}")
         
-        # Analyze if not cached
+        # Analyze if not cached - INCREASED FROM 50 TO 150 POSTS
         try:
             subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
@@ -238,8 +248,8 @@ class RedditAnalyzer:
             verified_users = 0
             total_users = 0
             
-            # Check recent posts
-            for post in subreddit.new(limit=50):
+            # Check recent posts - INCREASED LIMIT
+            for post in subreddit.new(limit=150):  # Increased from 50 to 150
                 try:
                     if not post.author or post.author.name in users_analyzed:
                         continue
@@ -269,9 +279,9 @@ class RedditAnalyzer:
                 except Exception as e:
                     continue
             
-            # Check recent comments for comment karma requirements
+            # Check recent comments for comment karma requirements - INCREASED LIMIT
             comment_users = set()
-            for comment in subreddit.comments(limit=30):
+            for comment in subreddit.comments(limit=100):  # Increased from 30 to 100
                 try:
                     if not comment.author or comment.author.name in comment_users:
                         continue
@@ -307,7 +317,7 @@ class RedditAnalyzer:
                 'users_analyzed': len(users_analyzed)
             }
             
-            # Cache in Airtable
+            # Cache in Airtable - FIXED DATE FORMAT
             if self.airtable and not result['from_cache']:
                 try:
                     # Check if record exists
@@ -323,7 +333,7 @@ class RedditAnalyzer:
                         'Account_Age_Days': result['account_age_days'],
                         'Confidence': result['confidence'],
                         'Requires_Verification': result['requires_verification'],
-                        'Last_Updated': current_date  # ← Simple date format
+                        'Last_Updated': current_date
                     }
                     
                     if existing:
@@ -333,11 +343,11 @@ class RedditAnalyzer:
                         
                 except Exception as e:
                     logging.warning(f"Airtable cache write failed: {e}")
-                        
-                        return result
-                        
-                    except Exception as e:
-                        return {'success': False, 'error': str(e)}
+            
+            return result
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def detect_fake_upvotes(self, subreddit_name: str) -> Dict[str, Any]:
         """Detect potential fake upvote patterns"""
