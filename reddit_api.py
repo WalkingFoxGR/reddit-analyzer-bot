@@ -372,7 +372,9 @@ class RedditAnalyzer:
                             'account_age_days': record.get('Account_Age_Days', 0),
                             'confidence': record.get('Confidence', 'Unknown'),
                             'requires_verification': record.get('Requires_Verification', False),
-                            'verification_method': record.get('Verification_Method', 'unknown')
+                            'verification_method': record.get('Verification_Method', 'unknown'),
+                            'verification_optional': record.get('Verification_Optional', False),
+                            'verification_note': record.get('Verification_Note', 'standard')
                         }
                     else:
                         logging.info(f"Cached data for {subreddit_name} is too old, analyzing fresh")
@@ -451,11 +453,13 @@ class RedditAnalyzer:
                 'verification_confidence': verification_check['confidence'],
                 'rules_based_verification': verification_check['rules_based'],
                 'flair_based_verification': verification_check['flair_based'],
+                'verification_optional': verification_check['verification_optional'],  # FIXED: Added this
+                'verification_note': verification_check['verification_note'],           # FIXED: Added this
                 'users_analyzed': len(users_analyzed),
                 'posts_scraped': post_limit
             }
             
-            # Save to Airtable
+            # Save to Airtable with new fields
             if self.airtable:
                 try:
                     existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
@@ -469,6 +473,8 @@ class RedditAnalyzer:
                         'Confidence': result['confidence'],
                         'Requires_Verification': result['requires_verification'],
                         'Verification_Method': result['verification_method'],
+                        'Verification_Optional': result['verification_optional'],  # FIXED: Added this
+                        'Verification_Note': result['verification_note'],           # FIXED: Added this
                         'Last_Updated': current_date,
                         'Posts_Analyzed': post_limit
                     }
