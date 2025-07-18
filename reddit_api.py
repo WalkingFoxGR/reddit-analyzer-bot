@@ -352,7 +352,7 @@ class RedditAnalyzer:
             users_analyzed = set()
             
             # Analyze recent posts and authors
-            for post in subreddit.new(limit=150):
+            for post in subreddit.new(limit=50):
                 try:
                     if not post.author or post.author.name in users_analyzed:
                         continue
