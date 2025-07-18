@@ -213,130 +213,130 @@ class RedditAnalyzer:
                 'error': str(e)
             }
     
-def check_verification_requirements(self, subreddit_name: str) -> Dict[str, Any]:
-    """Enhanced verification detection - checks rules AND recent policy changes"""
-    try:
-        subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
-        
-        # Check 1: Subreddit rules
-        rules_verification = False
-        verification_keywords = [
-            'verified', 'verification', 'verify', 'identity', 'id check',
-            'mod approval', 'moderator approval', 'pre-approved', 'whitelist',
-            'application', 'apply', 'request permission', 'manual review'
-        ]
-        
-        # NEW: Keywords that indicate verification is optional with karma
-        optional_verification_keywords = [
-            'verification is now not required', 'verification optional',
-            'undisclosed karma requirements', 'high enough karma',
-            'no longer required', 'karma alternative', 'non-verified posts'
-        ]
-        
-        verification_optional = False
-        
+    def check_verification_requirements(self, subreddit_name: str) -> Dict[str, Any]:
+        """Enhanced verification detection - checks rules AND recent policy changes"""
         try:
-            # Check rules
-            for rule in subreddit.rules:
-                rule_text = f"{rule.short_name} {rule.description}".lower()
-                if any(keyword in rule_text for keyword in verification_keywords):
-                    rules_verification = True
-                # Check for optional verification
-                if any(keyword in rule_text for keyword in optional_verification_keywords):
-                    verification_optional = True
-                    rules_verification = False  # Override if optional
+            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
-            # Check submission text
-            if subreddit.submit_text:
-                submit_text = subreddit.submit_text.lower()
-                if any(keyword in submit_text for keyword in verification_keywords):
-                    rules_verification = True
-                # Check for optional verification
-                if any(keyword in submit_text for keyword in optional_verification_keywords):
-                    verification_optional = True
-                    rules_verification = False
+            # Check 1: Subreddit rules
+            rules_verification = False
+            verification_keywords = [
+                'verified', 'verification', 'verify', 'identity', 'id check',
+                'mod approval', 'moderator approval', 'pre-approved', 'whitelist',
+                'application', 'apply', 'request permission', 'manual review'
+            ]
             
-            # Check subreddit description
-            if subreddit.public_description:
-                description = subreddit.public_description.lower()
-                if any(keyword in description for keyword in verification_keywords):
-                    rules_verification = True
-                # Check for optional verification
-                if any(keyword in description for keyword in optional_verification_keywords):
-                    verification_optional = True
-                    rules_verification = False
+            # NEW: Keywords that indicate verification is optional with karma
+            optional_verification_keywords = [
+                'verification is now not required', 'verification optional',
+                'undisclosed karma requirements', 'high enough karma',
+                'no longer required', 'karma alternative', 'non-verified posts'
+            ]
             
-            # NEW: Check pinned posts for policy changes
+            verification_optional = False
+            
             try:
-                for post in subreddit.hot(limit=5):
-                    if post.stickied:  # This is a pinned post
-                        post_text = f"{post.title} {post.selftext}".lower()
-                        if any(keyword in post_text for keyword in optional_verification_keywords):
-                            verification_optional = True
-                            rules_verification = False
-                        elif any(keyword in post_text for keyword in verification_keywords):
-                            rules_verification = True
-            except:
-                pass
-                        
-        except Exception as e:
-            logging.warning(f"Error checking rules for verification: {e}")
-        
-        # Check 2: Flair analysis (existing logic)
-        flair_verification = False
-        verified_users = 0
-        total_users = 0
-        
-        try:
-            for post in subreddit.hot(limit=50):
-                if post.author and hasattr(post, 'author_flair_text') and post.author_flair_text:
-                    if 'verified' in str(post.author_flair_text).lower():
-                        verified_users += 1
-                total_users += 1
-            
-            # If more than 30% of users are verified, likely requires verification
-            # BUT if we found optional verification text, reduce this threshold
-            threshold = 0.1 if verification_optional else 0.3
-            if total_users > 0 and (verified_users / total_users) > threshold:
-                flair_verification = True
+                # Check rules
+                for rule in subreddit.rules:
+                    rule_text = f"{rule.short_name} {rule.description}".lower()
+                    if any(keyword in rule_text for keyword in verification_keywords):
+                        rules_verification = True
+                    # Check for optional verification
+                    if any(keyword in rule_text for keyword in optional_verification_keywords):
+                        verification_optional = True
+                        rules_verification = False  # Override if optional
                 
+                # Check submission text
+                if subreddit.submit_text:
+                    submit_text = subreddit.submit_text.lower()
+                    if any(keyword in submit_text for keyword in verification_keywords):
+                        rules_verification = True
+                    # Check for optional verification
+                    if any(keyword in submit_text for keyword in optional_verification_keywords):
+                        verification_optional = True
+                        rules_verification = False
+                
+                # Check subreddit description
+                if subreddit.public_description:
+                    description = subreddit.public_description.lower()
+                    if any(keyword in description for keyword in verification_keywords):
+                        rules_verification = True
+                    # Check for optional verification
+                    if any(keyword in description for keyword in optional_verification_keywords):
+                        verification_optional = True
+                        rules_verification = False
+                
+                # NEW: Check pinned posts for policy changes
+                try:
+                    for post in subreddit.hot(limit=5):
+                        if post.stickied:  # This is a pinned post
+                            post_text = f"{post.title} {post.selftext}".lower()
+                            if any(keyword in post_text for keyword in optional_verification_keywords):
+                                verification_optional = True
+                                rules_verification = False
+                            elif any(keyword in post_text for keyword in verification_keywords):
+                                rules_verification = True
+                except:
+                    pass
+                            
+            except Exception as e:
+                logging.warning(f"Error checking rules for verification: {e}")
+            
+            # Check 2: Flair analysis (existing logic)
+            flair_verification = False
+            verified_users = 0
+            total_users = 0
+            
+            try:
+                for post in subreddit.hot(limit=50):
+                    if post.author and hasattr(post, 'author_flair_text') and post.author_flair_text:
+                        if 'verified' in str(post.author_flair_text).lower():
+                            verified_users += 1
+                    total_users += 1
+                
+                # If more than 30% of users are verified, likely requires verification
+                # BUT if we found optional verification text, reduce this threshold
+                threshold = 0.1 if verification_optional else 0.3
+                if total_users > 0 and (verified_users / total_users) > threshold:
+                    flair_verification = True
+                    
+            except Exception as e:
+                logging.warning(f"Error checking flairs for verification: {e}")
+            
+            # Combine results with new logic
+            requires_verification = rules_verification or flair_verification
+            
+            # Override if verification is optional
+            if verification_optional:
+                requires_verification = False
+            
+            confidence = 'High' if rules_verification else 'Medium' if flair_verification else 'Low'
+            
+            # Special case: if verification is optional, note it
+            verification_note = 'optional_with_karma' if verification_optional else 'standard'
+            
+            return {
+                'requires_verification': requires_verification,
+                'rules_based': rules_verification,
+                'flair_based': flair_verification,
+                'verification_optional': verification_optional,
+                'verification_note': verification_note,
+                'confidence': confidence,
+                'verified_users_ratio': round(verified_users / total_users, 2) if total_users > 0 else 0,
+                'method': 'enhanced_rules_and_flairs'
+            }
+            
         except Exception as e:
-            logging.warning(f"Error checking flairs for verification: {e}")
-        
-        # Combine results with new logic
-        requires_verification = rules_verification or flair_verification
-        
-        # Override if verification is optional
-        if verification_optional:
-            requires_verification = False
-        
-        confidence = 'High' if rules_verification else 'Medium' if flair_verification else 'Low'
-        
-        # Special case: if verification is optional, note it
-        verification_note = 'optional_with_karma' if verification_optional else 'standard'
-        
-        return {
-            'requires_verification': requires_verification,
-            'rules_based': rules_verification,
-            'flair_based': flair_verification,
-            'verification_optional': verification_optional,
-            'verification_note': verification_note,
-            'confidence': confidence,
-            'verified_users_ratio': round(verified_users / total_users, 2) if total_users > 0 else 0,
-            'method': 'enhanced_rules_and_flairs'
-        }
-        
-    except Exception as e:
-        logging.error(f"Error checking verification requirements: {e}")
-        return {
-            'requires_verification': False,
-            'rules_based': False,
-            'flair_based': False,
-            'verification_optional': False,
-            'verification_note': 'unknown',
-            'confidence': 'Unknown',
-            'error': str(e)
-        }
+            logging.error(f"Error checking verification requirements: {e}")
+            return {
+                'requires_verification': False,
+                'rules_based': False,
+                'flair_based': False,
+                'verification_optional': False,
+                'verification_note': 'unknown',
+                'confidence': 'Unknown',
+                'error': str(e)
+            }
     
     def analyze_karma_requirements(self, subreddit_name: str, post_limit: int = 150) -> Dict[str, Any]:
         """Analyze karma requirements with configurable post limit"""
