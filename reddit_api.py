@@ -59,7 +59,7 @@ class RedditAnalyzer:
             client_secret=REDDIT_CLIENT_SECRET,
             user_agent=REDDIT_USER_AGENT,
             ratelimit_seconds=300,
-            timeout=30  # Added timeout
+            timeout=30
         )
         
         # Cache for analysis results
@@ -866,7 +866,7 @@ class RedditAnalyzer:
                     total_comments += submission.num_comments
                     submission_count += 1
                     
-                    # Add to top posts if it's good enough
+                    # Add to top posts
                     top_posts.append(submission_data)
                     
                     # Rate limiting
@@ -1062,43 +1062,6 @@ def requirements_endpoint():
     
     result = analyzer.analyze_posting_requirements(subreddit, post_limit)
     return jsonify(result)
-
-@app.route('/analyze-complete', methods=['POST'])
-def analyze_complete_endpoint():
-    """Complete analysis WITH posting requirements (slower)"""
-    data = request.json
-    subreddit = data.get('subreddit')
-    days = data.get('days', 7)
-    post_limit = data.get('post_limit', 150)
-    
-    if not subreddit:
-        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
-    
-    # Validate subreddit exists
-    validation = validate_subreddit(subreddit)
-    if not validation['valid']:
-        return jsonify({
-            'success': False,
-            'error': validation['message'],
-            'error_type': validation['error']
-        }), 400
-    
-    # Get basic analysis
-    basic_result = analyzer.analyze_subreddit_with_timing(subreddit, days)
-    
-    if not basic_result['success']:
-        return jsonify(basic_result)
-    
-    # Add posting requirements
-    requirements_result = analyzer.analyze_posting_requirements(subreddit, post_limit)
-    
-    if requirements_result['success']:
-        basic_result['restrictions'] = {
-            'karma_requirements': requirements_result['karma_requirements'],
-            'fake_upvote_detection': requirements_result['fake_upvote_detection']
-        }
-    
-    return jsonify(basic_result)
 
 @app.route('/analyze-user', methods=['POST'])
 def analyze_user_endpoint():
