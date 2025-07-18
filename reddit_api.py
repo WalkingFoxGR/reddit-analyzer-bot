@@ -236,7 +236,7 @@ class RedditAnalyzer:
             except Exception as e:
                 logging.warning(f"Airtable cache read failed: {e}")
         
-        # Analyze if not cached - INCREASED FROM 50 TO 150 POSTS
+        # Analyze if not cached - INCREASED FROM 50 TO 100 POSTS
         try:
             subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
@@ -249,7 +249,7 @@ class RedditAnalyzer:
             total_users = 0
             
             # Check recent posts - INCREASED LIMIT
-            for post in subreddit.new(limit=150):  # Increased from 50 to 150
+            for post in subreddit.new(limit=100):  # Increased from 50 to 100
                 try:
                     if not post.author or post.author.name in users_analyzed:
                         continue
@@ -281,7 +281,7 @@ class RedditAnalyzer:
             
             # Check recent comments for comment karma requirements - INCREASED LIMIT
             comment_users = set()
-            for comment in subreddit.comments(limit=100):  # Increased from 30 to 100
+            for comment in subreddit.comments(limit=30):  # Increased from 30 to 100
                 try:
                     if not comment.author or comment.author.name in comment_users:
                         continue
