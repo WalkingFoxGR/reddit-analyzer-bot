@@ -213,26 +213,116 @@ class RedditAnalyzer:
                 'error': str(e)
             }
     
+    def check_verification_requirements(self, subreddit_name: str) -> Dict[str, Any]:
+        """Enhanced verification detection - checks rules AND flairs"""
+        try:
+            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            # Check 1: Subreddit rules
+            rules_verification = False
+            verification_keywords = [
+                'verified', 'verification', 'verify', 'identity', 'id check',
+                'mod approval', 'moderator approval', 'pre-approved', 'whitelist',
+                'application', 'apply', 'request permission', 'manual review'
+            ]
+            
+            try:
+                # Check rules
+                for rule in subreddit.rules:
+                    rule_text = f"{rule.short_name} {rule.description}".lower()
+                    if any(keyword in rule_text for keyword in verification_keywords):
+                        rules_verification = True
+                        break
+                
+                # Check submission text
+                if subreddit.submit_text:
+                    submit_text = subreddit.submit_text.lower()
+                    if any(keyword in submit_text for keyword in verification_keywords):
+                        rules_verification = True
+                
+                # Check subreddit description
+                if subreddit.public_description:
+                    description = subreddit.public_description.lower()
+                    if any(keyword in description for keyword in verification_keywords):
+                        rules_verification = True
+                        
+            except Exception as e:
+                logging.warning(f"Error checking rules for verification: {e}")
+            
+            # Check 2: Flair analysis (existing logic)
+            flair_verification = False
+            verified_users = 0
+            total_users = 0
+            
+            try:
+                for post in subreddit.hot(limit=50):
+                    if post.author and hasattr(post, 'author_flair_text') and post.author_flair_text:
+                        if 'verified' in str(post.author_flair_text).lower():
+                            verified_users += 1
+                    total_users += 1
+                
+                # If more than 30% of users are verified, likely requires verification
+                if total_users > 0 and (verified_users / total_users) > 0.3:
+                    flair_verification = True
+                    
+            except Exception as e:
+                logging.warning(f"Error checking flairs for verification: {e}")
+            
+            # Combine results
+            requires_verification = rules_verification or flair_verification
+            
+            confidence = 'High' if rules_verification else 'Medium' if flair_verification else 'Low'
+            
+            return {
+                'requires_verification': requires_verification,
+                'rules_based': rules_verification,
+                'flair_based': flair_verification,
+                'confidence': confidence,
+                'verified_users_ratio': round(verified_users / total_users, 2) if total_users > 0 else 0,
+                'method': 'rules_and_flairs'
+            }
+            
+        except Exception as e:
+            logging.error(f"Error checking verification requirements: {e}")
+            return {
+                'requires_verification': False,
+                'rules_based': False,
+                'flair_based': False,
+                'confidence': 'Unknown',
+                'error': str(e)
+            }
+    
     def analyze_karma_requirements(self, subreddit_name: str) -> Dict[str, Any]:
-        """Analyze karma requirements with caching - FIXED LOGIC"""
+        """Analyze karma requirements with enhanced caching and verification detection"""
         
         # Check Airtable cache first
         if self.airtable:
             try:
+                # Use exact field names from your Airtable (case-sensitive)
                 records = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
                 if records:
                     record = records[0]['fields']
-                    # Fix date parsing - try different formats
+                    
+                    # Fix date parsing with multiple format support
                     try:
                         last_updated_str = record.get('Last_Updated', '2000-01-01')
                         if 'T' in last_updated_str:
+                            # ISO format with timezone
                             last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
                         else:
+                            # Simple date format
                             last_updated = datetime.strptime(last_updated_str, '%Y-%m-%d')
-                    except:
-                        last_updated = datetime(2000, 1, 1)
+                            
+                        # Make timezone-aware if needed
+                        if last_updated.tzinfo is None:
+                            last_updated = last_updated.replace(tzinfo=timezone.utc)
+                            
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Date parsing error: {e}")
+                        last_updated = datetime(2000, 1, 1, tzinfo=timezone.utc)
                     
-                    if (datetime.utcnow() - last_updated).days < 30:  # 30-day cache
+                    # Check if data is fresh (30 days)
+                    if (datetime.now(timezone.utc) - last_updated).days < 30:
                         logging.info(f"Using cached karma data for {subreddit_name}")
                         return {
                             'success': True,
@@ -241,27 +331,27 @@ class RedditAnalyzer:
                             'comment_karma_min': record.get('Comment_Karma_Min', 0),
                             'account_age_days': record.get('Account_Age_Days', 0),
                             'confidence': record.get('Confidence', 'Unknown'),
-                            'requires_verification': record.get('Requires_Verification', False)
+                            'requires_verification': record.get('Requires_Verification', False),
+                            'verification_method': record.get('Verification_Method', 'unknown')
                         }
                     else:
                         logging.info(f"Cached data for {subreddit_name} is too old, analyzing fresh")
             except Exception as e:
                 logging.warning(f"Airtable cache read failed: {e}")
         
-        # Analyze if not cached
+        # Analyze if not cached or cache failed
         try:
             logging.info(f"Starting fresh karma analysis for {subreddit_name}")
             subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
+            # Track minimum karma found
             min_post_karma = float('inf')
             min_comment_karma = float('inf')
             min_account_age = float('inf')
             
             users_analyzed = set()
-            verified_users = 0
-            total_users = 0
             
-            # Check recent posts and get BOTH post karma AND comment karma from post authors
+            # Analyze recent posts and authors
             for post in subreddit.new(limit=150):
                 try:
                     if not post.author or post.author.name in users_analyzed:
@@ -270,22 +360,25 @@ class RedditAnalyzer:
                     users_analyzed.add(post.author.name)
                     user = safe_reddit_call(lambda: self.reddit.redditor(post.author.name))
                     
-                    # Track minimums for BOTH post and comment karma from the same users
-                    if user.link_karma < min_post_karma:
-                        min_post_karma = user.link_karma
-                    if user.comment_karma < min_comment_karma:
-                        min_comment_karma = user.comment_karma
+                    # Get both post karma (link_karma) and comment karma
+                    post_karma = getattr(user, 'link_karma', 0)
+                    comment_karma = getattr(user, 'comment_karma', 0)
+                    
+                    # Track minimums
+                    if post_karma < min_post_karma:
+                        min_post_karma = post_karma
+                    if comment_karma < min_comment_karma:
+                        min_comment_karma = comment_karma
                         
-                    account_age = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
-                    if account_age < min_account_age:
-                        min_account_age = account_age
+                    # Account age in days
+                    try:
+                        account_age = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
+                        if account_age < min_account_age:
+                            min_account_age = account_age
+                    except (AttributeError, OSError):
+                        pass
                     
-                    # Check for verified status
-                    if hasattr(post, 'author_flair_text') and post.author_flair_text:
-                        if 'verified' in str(post.author_flair_text).lower():
-                            verified_users += 1
-                    total_users += 1
-                    
+                    # Rate limiting
                     if len(users_analyzed) % 10 == 0:
                         time.sleep(0.3)
                         
@@ -295,42 +388,51 @@ class RedditAnalyzer:
             
             logging.info(f"Analyzed {len(users_analyzed)} users for {subreddit_name}")
             
-            # Calculate confidence
-            if min_post_karma > 100 or min_comment_karma > 100:
+            # Calculate requirements (subtract 1 for buffer)
+            post_karma_req = max(0, min_post_karma - 1) if min_post_karma != float('inf') else 0
+            comment_karma_req = max(0, min_comment_karma - 1) if min_comment_karma != float('inf') else 0
+            account_age_req = max(0, min_account_age - 1) if min_account_age != float('inf') else 0
+            
+            # Determine confidence
+            if post_karma_req > 100 or comment_karma_req > 100:
                 confidence = 'High'
-            elif min_post_karma > 10 or min_comment_karma > 10:
+            elif post_karma_req > 10 or comment_karma_req > 10:
                 confidence = 'Medium'
             else:
                 confidence = 'Low'
             
-            # Check verification requirement
-            requires_verification = (verified_users / total_users > 0.5) if total_users > 0 else False
+            # **ENHANCED VERIFICATION DETECTION**
+            verification_check = self.check_verification_requirements(subreddit_name)
             
             result = {
                 'success': True,
                 'from_cache': False,
-                'post_karma_min': max(0, min_post_karma - 1) if min_post_karma != float('inf') else 0,
-                'comment_karma_min': max(0, min_comment_karma - 1) if min_comment_karma != float('inf') else 0,
-                'account_age_days': max(0, min_account_age - 1) if min_account_age != float('inf') else 0,
+                'post_karma_min': post_karma_req,
+                'comment_karma_min': comment_karma_req,
+                'account_age_days': account_age_req,
                 'confidence': confidence,
-                'requires_verification': requires_verification,
+                'requires_verification': verification_check['requires_verification'],
+                'verification_method': verification_check['method'],
+                'verification_confidence': verification_check['confidence'],
+                'rules_based_verification': verification_check['rules_based'],
+                'flair_based_verification': verification_check['flair_based'],
                 'users_analyzed': len(users_analyzed)
             }
             
             logging.info(f"Karma analysis result for {subreddit_name}: {result}")
             
-            # Cache in Airtable - ENHANCED DEBUGGING
-            if self.airtable and not result['from_cache']:
+            # **FIXED AIRTABLE SAVING** - Use exact field names and proper date format
+            if self.airtable:
                 try:
-                    logging.info(f"Attempting to save to Airtable for {subreddit_name}")
+                    logging.info(f"Saving to Airtable for {subreddit_name}")
                     
                     # Check if record exists
                     existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
-                    logging.info(f"Existing records found: {len(existing)}")
                     
-                    # Use simple date format
+                    # Use ISO date format (YYYY-MM-DD)
                     current_date = datetime.utcnow().strftime('%Y-%m-%d')
                     
+                    # **CRITICAL: Use exact field names from your Airtable**
                     record_data = {
                         'Subreddit': subreddit_name,
                         'Post_Karma_Min': result['post_karma_min'],
@@ -338,25 +440,26 @@ class RedditAnalyzer:
                         'Account_Age_Days': result['account_age_days'],
                         'Confidence': result['confidence'],
                         'Requires_Verification': result['requires_verification'],
+                        'Verification_Method': result['verification_method'],
                         'Last_Updated': current_date
                     }
                     
-                    logging.info(f"Record data to save: {record_data}")
+                    logging.info(f"Airtable record data: {record_data}")
                     
                     if existing:
+                        # Update existing record
                         updated = self.karma_table.update(existing[0]['id'], record_data)
-                        logging.info(f"Updated existing record: {updated}")
+                        logging.info(f"Updated Airtable record: {updated['id']}")
                     else:
+                        # Create new record
                         created = self.karma_table.create(record_data)
-                        logging.info(f"Created new record: {created}")
+                        logging.info(f"Created Airtable record: {created['id']}")
                     
                     logging.info(f"Successfully saved to Airtable for {subreddit_name}")
-                        
+                            
                 except Exception as e:
-                    logging.error(f"Airtable cache write failed for {subreddit_name}: {e}")
-                    # Let's also log the full traceback
-                    import traceback
-                    logging.error(f"Full traceback: {traceback.format_exc()}")
+                    logging.error(f"Airtable save failed for {subreddit_name}: {e}")
+                    logging.error(f"Error details: {type(e).__name__}: {str(e)}")
             
             return result
             
@@ -1371,6 +1474,9 @@ def analyze_flairs():
         subreddit = safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
         flair_stats = {}
         
+        # Store sample posts for each flair
+        flair_samples = defaultdict(list)
+        
         for post in subreddit.hot(limit=100):
             flair = post.link_flair_text or 'No Flair'
             if flair not in flair_stats:
@@ -1383,6 +1489,15 @@ def analyze_flairs():
             flair_stats[flair]['count'] += 1
             flair_stats[flair]['total_score'] += post.score
             flair_stats[flair]['total_comments'] += post.num_comments
+            
+            # Store sample posts (max 3 per flair)
+            if len(flair_samples[flair]) < 3:
+                flair_samples[flair].append({
+                    'title': post.title,
+                    'score': post.score,
+                    'comments': post.num_comments,
+                    'url': f"https://reddit.com{post.permalink}"
+                })
         
         # Calculate averages
         flair_analysis = []
@@ -1392,7 +1507,8 @@ def analyze_flairs():
                     'flair': flair,
                     'post_count': stats['count'],
                     'avg_score': round(stats['total_score'] / stats['count'], 2),
-                    'avg_comments': round(stats['total_comments'] / stats['count'], 2)
+                    'avg_comments': round(stats['total_comments'] / stats['count'], 2),
+                    'sample_posts': flair_samples[flair]
                 })
         
         # Sort by average score
@@ -1427,9 +1543,22 @@ def cleanup_cache():
 def cache_status():
     """Check cache status and memory usage"""
     cleanup_cache()
+    
+    # Test Airtable connection
+    airtable_status = 'disconnected'
+    if analyzer.airtable:
+        try:
+            # Try to get table info
+            tables = analyzer.airtable.bases()
+            airtable_status = 'connected'
+        except:
+            airtable_status = 'error'
+    
     return jsonify({
         'cache_entries': len(analyzer.analysis_cache),
         'cache_keys': list(analyzer.analysis_cache.keys()),
+        'airtable_status': airtable_status,
+        'reddit_user_agent': REDDIT_USER_AGENT,
         'timestamp': datetime.utcnow().isoformat()
     })
 
