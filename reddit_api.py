@@ -321,6 +321,7 @@ class RedditAnalyzer:
                         'Confidence': result['confidence'],
                         'Requires_Verification': result['requires_verification'],
                         'Last_Updated': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+                     }
                     
                     if existing:
                         self.karma_table.update(existing[0]['id'], record_data)
