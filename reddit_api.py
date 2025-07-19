@@ -105,8 +105,74 @@ class RedditAnalyzer:
             # If we can't determine, assume regular subreddit
             return False
 
+    def calculate_realistic_engagement_metrics(self, post_scores: List[int]) -> Dict[str, Any]:
+        """Calculate outlier-resistant engagement metrics"""
+        if not post_scores or len(post_scores) < 5:
+            return {
+                'median_score': 0,
+                'mean_score': 0,
+                'typical_range': (0, 0),
+                'outlier_adjusted_avg': 0,
+                'consistency_rating': 'insufficient_data',
+                'has_outliers': False,
+                'score_difference': 0
+            }
+        
+        # Sort scores for percentile calculations
+        sorted_scores = sorted(post_scores)
+        n = len(sorted_scores)
+        
+        # 1. MEDIAN (most important - not affected by outliers)
+        median_score = statistics.median(sorted_scores)
+        
+        # 2. ARITHMETIC MEAN (for comparison)
+        mean_score = statistics.mean(sorted_scores)
+        
+        # 3. TYPICAL RANGE (25th to 75th percentile)
+        q25_index = max(0, int(n * 0.25) - 1)
+        q75_index = min(n - 1, int(n * 0.75))
+        typical_low = sorted_scores[q25_index]
+        typical_high = sorted_scores[q75_index]
+        
+        # 4. OUTLIER-ADJUSTED AVERAGE (remove extreme outliers)
+        # Remove top 10% and bottom 10% for more realistic average
+        start_index = max(0, int(n * 0.1))
+        end_index = min(n, int(n * 0.9))
+        if end_index > start_index:
+            trimmed_scores = sorted_scores[start_index:end_index]
+            outlier_adjusted_avg = statistics.mean(trimmed_scores) if trimmed_scores else median_score
+        else:
+            outlier_adjusted_avg = median_score
+        
+        # 5. DETECT OUTLIERS (significant difference between mean and median)
+        score_difference = abs(mean_score - median_score)
+        has_outliers = score_difference > max(5, median_score * 0.3)  # 30% difference or 5+ points
+        
+        # 6. CONSISTENCY RATING (lighter penalties)
+        if typical_high <= typical_low * 2:  # Very tight range
+            consistency = 'very_consistent'
+        elif typical_high <= typical_low * 4:  # Reasonable range
+            consistency = 'consistent'
+        elif typical_high <= typical_low * 8:  # Moderate variance
+            consistency = 'moderately_consistent'
+        elif has_outliers and score_difference > median_score:  # Big outliers
+            consistency = 'outlier_dependent'
+        else:
+            consistency = 'variable'
+        
+        return {
+            'median_score': round(median_score, 1),
+            'mean_score': round(mean_score, 1),
+            'typical_range': (typical_low, typical_high),
+            'outlier_adjusted_avg': round(outlier_adjusted_avg, 1),
+            'consistency_rating': consistency,
+            'has_outliers': has_outliers,
+            'score_difference': round(score_difference, 1),
+            'total_posts_analyzed': n
+        }
+
     def analyze_post_consistency(self, post_scores: List[int], is_nsfw: bool = False) -> Dict[str, Any]:
-        """Analyze consistency of post performance"""
+        """Analyze consistency of post performance with lighter penalties"""
         if not post_scores or len(post_scores) < 5:
             return {
                 'consistency_score': 0,
@@ -133,20 +199,20 @@ class RedditAnalyzer:
         good_ratio = good_posts / len(post_scores)
         great_ratio = great_posts / len(post_scores)
         
-        # Consistency scoring (0-100)
+        # Consistency scoring (0-100) - LIGHTER PENALTIES
         if good_ratio >= 0.7:  # 70%+ posts are good
             consistency_base = 90
         elif good_ratio >= 0.5:  # 50%+ posts are good  
-            consistency_base = 70
+            consistency_base = 75  # Increased from 70
         elif good_ratio >= 0.3:  # 30%+ posts are good
-            consistency_base = 50
+            consistency_base = 60  # Increased from 50
         elif good_ratio >= 0.2:  # 20%+ posts are good
-            consistency_base = 30
+            consistency_base = 45  # Increased from 30
         else:  # Less than 20% are good
-            consistency_base = 10
+            consistency_base = 30  # Increased from 10
         
         # Bonus for having great posts
-        great_bonus = min(20, great_ratio * 100)  # Up to 20 point bonus
+        great_bonus = min(15, great_ratio * 75)  # Reduced bonus to balance
         
         consistency_score = min(100, consistency_base + great_bonus)
         
@@ -170,52 +236,75 @@ class RedditAnalyzer:
             'total_posts_analyzed': len(post_scores)
         }
 
-    def calculate_effectiveness_v2(self, avg_posts_per_day: float, avg_score_per_post: float,
+    def calculate_effectiveness_v3(self, avg_posts_per_day: float, post_scores: List[int],
                                   avg_comments_per_post: float, subscribers: int, 
-                                  post_scores: List[int] = None, is_nsfw: bool = False) -> Dict[str, Any]:
-        """Enhanced effectiveness scoring with additional upvote and comment tiers"""
+                                  is_nsfw: bool = False) -> Dict[str, Any]:
+        """FIXED effectiveness calculation using median instead of misleading mean"""
         
-        # 1. ENGAGEMENT SCORE (50% weight) - Enhanced with new tiers
+        # Get realistic engagement metrics
+        engagement_metrics = self.calculate_realistic_engagement_metrics(post_scores)
+        
+        # Use MEDIAN instead of arithmetic mean for scoring
+        median_score = engagement_metrics['median_score']
+        mean_score = engagement_metrics['mean_score']
+        consistency_rating = engagement_metrics['consistency_rating']
+        has_outliers = engagement_metrics['has_outliers']
+        
+        # 1. ENGAGEMENT SCORE (50% weight) - Based on MEDIAN score
         if is_nsfw:
             # NSFW scoring with enhanced tiers
-            if avg_score_per_post >= 101:        # NEW: 101+ tier
+            if median_score >= 101:
                 engagement_score = 98
-            elif avg_score_per_post >= 60:       # NEW: 60-100 tier  
+            elif median_score >= 60:
                 engagement_score = 85
-            elif avg_score_per_post >= 40:       # Adjusted existing tier
-                engagement_score = 75            # Reduced from 80
-            elif avg_score_per_post >= 25:
+            elif median_score >= 40:
+                engagement_score = 75
+            elif median_score >= 25:
                 engagement_score = 65
-            elif avg_score_per_post >= 15:
+            elif median_score >= 15:
                 engagement_score = 45
-            elif avg_score_per_post >= 8:
+            elif median_score >= 8:
                 engagement_score = 25
             else:
                 engagement_score = 10
         else:
             # Regular subreddit scoring with enhanced tiers
-            if avg_score_per_post >= 101:        # NEW: 101+ tier
+            if median_score >= 101:
                 engagement_score = 98
-            elif avg_score_per_post >= 60:       # NEW: 60-100 tier  
+            elif median_score >= 60:
                 engagement_score = 85
-            elif avg_score_per_post >= 50:       # Adjusted existing tier
-                engagement_score = 75            # Reduced from 80
-            elif avg_score_per_post >= 25:
+            elif median_score >= 50:
+                engagement_score = 75
+            elif median_score >= 25:
                 engagement_score = 65
-            elif avg_score_per_post >= 15:
+            elif median_score >= 15:
                 engagement_score = 50
-            elif avg_score_per_post >= 8:
+            elif median_score >= 8:
                 engagement_score = 35
-            elif avg_score_per_post >= 3:
+            elif median_score >= 3:
                 engagement_score = 20
             else:
                 engagement_score = 10
         
+        # Add LIGHT consistency bonus/penalty
+        if consistency_rating == 'very_consistent':
+            consistency_modifier = 1.05  # 5% bonus
+        elif consistency_rating == 'consistent':
+            consistency_modifier = 1.02  # 2% bonus
+        elif consistency_rating == 'moderately_consistent':
+            consistency_modifier = 1.0   # No change
+        elif consistency_rating == 'variable':
+            consistency_modifier = 0.98  # 2% penalty (light)
+        else:  # outlier_dependent
+            consistency_modifier = 0.95  # 5% penalty (light)
+        
+        engagement_score = max(0, min(100, engagement_score * consistency_modifier))
+        
         # Enhanced Comment Bonus (up to 18 points)
-        if avg_comments_per_post >= 51:         # NEW: 51+ tier
-            comment_bonus = 18                  # Higher bonus
-        elif avg_comments_per_post >= 20:       # NEW: 20-50 tier
-            comment_bonus = 12                  # Reduced from 15
+        if avg_comments_per_post >= 51:
+            comment_bonus = 18
+        elif avg_comments_per_post >= 20:
+            comment_bonus = 12
         elif avg_comments_per_post >= 10:
             comment_bonus = 10
         elif avg_comments_per_post >= 5:
@@ -227,7 +316,7 @@ class RedditAnalyzer:
         
         engagement_score = min(100, engagement_score + comment_bonus)
         
-        # 2. POSTING FREQUENCY SCORE (25% weight) - Same as before
+        # 2. POSTING FREQUENCY SCORE (25% weight)
         if avg_posts_per_day <= 0.5:
             frequency_score = 100
         elif avg_posts_per_day <= 1:
@@ -243,11 +332,11 @@ class RedditAnalyzer:
         else:
             frequency_score = 10
         
-        # 3. CONSISTENCY SCORE (25% weight) - From post score analysis
-        consistency_data = self.analyze_post_consistency(post_scores or [], is_nsfw)
+        # 3. CONSISTENCY SCORE (25% weight) - From traditional consistency analysis
+        consistency_data = self.analyze_post_consistency(post_scores, is_nsfw)
         consistency_score = consistency_data['consistency_score']
         
-        # 4. SIZE ADJUSTMENT - Same as before
+        # 4. SIZE ADJUSTMENT
         if subscribers < 1000:
             size_modifier = 1.1
         elif subscribers < 10000:
@@ -276,15 +365,23 @@ class RedditAnalyzer:
                 'engagement_score': round(engagement_score, 1),
                 'frequency_score': round(frequency_score, 1), 
                 'consistency_score': round(consistency_score, 1),
-                'size_modifier': size_modifier
+                'size_modifier': size_modifier,
+                'consistency_modifier': consistency_modifier
             },
+            'realistic_metrics': engagement_metrics,
             'consistency_data': consistency_data,
+            'score_transparency': {
+                'median_score_used': median_score,
+                'mean_score_reference': mean_score,
+                'difference': engagement_metrics['score_difference'],
+                'outlier_warning': has_outliers
+            },
             'is_nsfw': is_nsfw,
-            'scoring_method': 'v2_enhanced_tiers'
+            'scoring_method': 'v3_median_based'
         }
 
     def analyze_subreddit_enhanced(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
-        """Enhanced analysis with consistency measurement and realistic scoring"""
+        """Enhanced analysis with MEDIAN-based scoring (outlier-resistant)"""
         try:
             subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             subscribers = subreddit.subscribers
@@ -296,14 +393,14 @@ class RedditAnalyzer:
             post_count = 0
             total_score = 0
             total_comments = 0
-            post_scores = []  # Track individual scores for consistency
+            post_scores = []  # Track individual scores for median calculation
             
             # Track top post
             top_post = None
             top_post_score = 0
             
             # Analyze new posts
-            for post in subreddit.new(limit=500):  # Increased limit for better consistency analysis
+            for post in subreddit.new(limit=500):  # Increased limit for better analysis
                 post_date = datetime.utcfromtimestamp(post.created_utc)
                 if post_date < date_threshold:
                     break
@@ -314,7 +411,7 @@ class RedditAnalyzer:
                 
                 total_score += score
                 total_comments += comments
-                post_scores.append(score)
+                post_scores.append(score)  # Store for median calculation
                 
                 # Track highest scoring post
                 if score > top_post_score:
@@ -356,30 +453,38 @@ class RedditAnalyzer:
             
             # Calculate basic metrics
             avg_posts_per_day = post_count / days
-            avg_score_per_post = total_score / post_count if post_count > 0 else 0
             avg_comments_per_post = total_comments / post_count if post_count > 0 else 0
             
-            # NEW: Use enhanced effectiveness calculation
-            effectiveness_data = self.calculate_effectiveness_v2(
-                avg_posts_per_day, avg_score_per_post, avg_comments_per_post, 
-                subscribers, post_scores, is_nsfw
+            # OLD: Misleading arithmetic mean
+            old_avg_score_per_post = total_score / post_count if post_count > 0 else 0
+            
+            # NEW: Use median-based effectiveness calculation
+            effectiveness_data = self.calculate_effectiveness_v3(
+                avg_posts_per_day, post_scores, avg_comments_per_post, 
+                subscribers, is_nsfw
             )
+            
+            # Get median score for display
+            median_score_per_post = effectiveness_data['realistic_metrics']['median_score']
             
             result = {
                 'success': True,
                 'subreddit': subreddit_name,
                 'subscribers': subscribers,
                 'avg_posts_per_day': round(avg_posts_per_day, 2),
-                'avg_score_per_post': round(avg_score_per_post, 2),
+                'median_score_per_post': round(median_score_per_post, 2),  # NEW: Primary metric
+                'avg_score_per_post': round(old_avg_score_per_post, 2),    # OLD: For reference
                 'avg_comments_per_post': round(avg_comments_per_post, 2),
                 'effectiveness_score': effectiveness_data['effectiveness_score'],
                 'effectiveness_breakdown': effectiveness_data['breakdown'],
+                'realistic_metrics': effectiveness_data['realistic_metrics'],
                 'consistency_analysis': effectiveness_data['consistency_data'],
+                'score_transparency': effectiveness_data['score_transparency'],
                 'is_nsfw': is_nsfw,
                 'days_analyzed': days,
                 'posts_analyzed_for_scoring': len(post_scores),
                 'top_post': top_post,
-                'scoring_version': 'v2_enhanced_tiers'
+                'scoring_version': 'v3_median_based'
             }
             
             return result
@@ -392,15 +497,16 @@ class RedditAnalyzer:
     def calculate_effectiveness(self, avg_posts_per_day: float, avg_score_per_post: float,
                               avg_comments_per_post: float, subscribers: int) -> float:
         """Old effectiveness calculation - kept for compatibility"""
-        logging.warning("Using deprecated calculate_effectiveness method. Use calculate_effectiveness_v2 instead.")
+        logging.warning("Using deprecated calculate_effectiveness method. Use calculate_effectiveness_v3 instead.")
         
-        # Just return the new calculation without the advanced features
-        result = self.calculate_effectiveness_v2(avg_posts_per_day, avg_score_per_post, 
+        # Create fake post scores based on average for compatibility
+        fake_post_scores = [int(avg_score_per_post)] * 10
+        result = self.calculate_effectiveness_v3(avg_posts_per_day, fake_post_scores, 
                                                avg_comments_per_post, subscribers)
         return result['effectiveness_score']
     
     def save_analyze_to_airtable(self, analysis_data: Dict[str, Any]) -> bool:
-        """Save enhanced analyze metrics to Airtable"""
+        """Save enhanced analyze metrics to Airtable with median data"""
         if not self.airtable:
             logging.warning("Airtable not initialized, skipping save")
             return False
@@ -418,14 +524,32 @@ class RedditAnalyzer:
                 'Subscribers': analysis_data.get('subscribers', 0),
                 'Effectiveness_Score': analysis_data.get('effectiveness_score', 0),
                 'Avg_Posts_Per_Day': analysis_data.get('avg_posts_per_day', 0),
-                'Avg_Score_Per_Post': analysis_data.get('avg_score_per_post', 0),
+                'Median_Score_Per_Post': analysis_data.get('median_score_per_post', 0),  # NEW
+                'Avg_Score_Per_Post': analysis_data.get('avg_score_per_post', 0),        # OLD
                 'Avg_Comments_Per_Post': analysis_data.get('avg_comments_per_post', 0),
                 'Days_Analyzed': analysis_data.get('days_analyzed', 7),
                 'Is_NSFW': analysis_data.get('is_nsfw', False),
                 'Posts_Analyzed_For_Scoring': analysis_data.get('posts_analyzed_for_scoring', 0),
-                'Scoring_Version': analysis_data.get('scoring_version', 'v2_enhanced_tiers'),
+                'Scoring_Version': analysis_data.get('scoring_version', 'v3_median_based'),
                 'Last_Analyzed': current_date
             }
+            
+            # Add transparency data
+            if analysis_data.get('score_transparency'):
+                transparency = analysis_data['score_transparency']
+                record_data.update({
+                    'Score_Difference': transparency.get('difference', 0),
+                    'Has_Outliers': transparency.get('outlier_warning', False)
+                })
+            
+            # Add realistic metrics
+            if analysis_data.get('realistic_metrics'):
+                metrics = analysis_data['realistic_metrics']
+                record_data.update({
+                    'Consistency_Rating': metrics.get('consistency_rating', ''),
+                    'Typical_Score_Low': metrics.get('typical_range', (0, 0))[0],
+                    'Typical_Score_High': metrics.get('typical_range', (0, 0))[1]
+                })
             
             # Add consistency data
             if analysis_data.get('consistency_analysis'):
@@ -446,7 +570,8 @@ class RedditAnalyzer:
                     'Engagement_Score': breakdown.get('engagement_score', 0),
                     'Frequency_Score': breakdown.get('frequency_score', 0),
                     'Consistency_Component': breakdown.get('consistency_score', 0),
-                    'Size_Modifier': breakdown.get('size_modifier', 1.0)
+                    'Size_Modifier': breakdown.get('size_modifier', 1.0),
+                    'Consistency_Modifier': breakdown.get('consistency_modifier', 1.0)
                 })
             
             # Add top post data if available
@@ -1114,9 +1239,9 @@ class RedditAnalyzer:
             }
     
     def analyze_subreddit_with_timing(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
-        """FAST subreddit analysis with enhanced realistic scoring"""
+        """FAST subreddit analysis with MEDIAN-based scoring"""
         try:
-            # Get enhanced analysis (includes consistency and NSFW detection)
+            # Get enhanced analysis (now uses median scoring)
             basic_analysis = self.analyze_subreddit_enhanced(subreddit_name, days)
             
             if not basic_analysis['success']:
@@ -1165,7 +1290,7 @@ class RedditAnalyzer:
             return {'success': False, 'error': str(e)}
     
     def analyze_subreddit(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
-        """Updated to use enhanced scoring - kept for backward compatibility"""
+        """Updated to use median-based scoring - kept for backward compatibility"""
         return self.analyze_subreddit_enhanced(subreddit_name, days)
     
     def analyze_user(self, username: str, days: int = 30, limit: int = 100) -> Dict[str, Any]:
@@ -1197,6 +1322,7 @@ class RedditAnalyzer:
             total_score = 0
             total_comments = 0
             submission_count = 0
+            post_scores = []
             
             # Track top posts
             top_posts = []
@@ -1224,6 +1350,7 @@ class RedditAnalyzer:
                     }
                     
                     submissions.append(submission_data)
+                    post_scores.append(submission.score)
                     
                     # Update subreddit statistics
                     subreddit_name = submission.subreddit.display_name
@@ -1250,8 +1377,9 @@ class RedditAnalyzer:
             submissions.sort(key=lambda x: x['score'], reverse=True)
             top_posts.sort(key=lambda x: x['score'], reverse=True)
             
-            # Calculate averages
+            # Calculate averages (both mean and median for transparency)
             avg_score_per_post = total_score / submission_count if submission_count > 0 else 0
+            median_score_per_post = statistics.median(post_scores) if post_scores else 0
             avg_comments_per_post = total_comments / submission_count if submission_count > 0 else 0
             posts_per_day = submission_count / days
             
@@ -1302,6 +1430,7 @@ class RedditAnalyzer:
                     'total_score': total_score,
                     'total_comments': total_comments,
                     'avg_score_per_post': round(avg_score_per_post, 2),
+                    'median_score_per_post': round(median_score_per_post, 2),  # NEW
                     'avg_comments_per_post': round(avg_comments_per_post, 2),
                     'posts_per_day': round(posts_per_day, 2)
                 },
@@ -1385,7 +1514,7 @@ def validate_subreddit(subreddit_name: str) -> Dict[str, Any]:
 
 @app.route('/analyze', methods=['POST'])
 def analyze_endpoint():
-    """FAST analyze endpoint with enhanced realistic scoring"""
+    """FAST analyze endpoint with MEDIAN-based scoring"""
     data = request.json
     subreddit = data.get('subreddit')
     days = data.get('days', 7)
@@ -1490,7 +1619,7 @@ def analyze_user_endpoint():
 
 @app.route('/analyze-multiple', methods=['POST'])
 def analyze_multiple_endpoint():
-    """Enhanced compare endpoint with enhanced realistic scoring"""
+    """Enhanced compare endpoint with median-based scoring"""
     data = request.json
     subreddits_input = data.get('subreddits', [])
     days = data.get('days', 7)
@@ -1595,7 +1724,7 @@ def search_endpoint():
 
 @app.route('/search-and-analyze', methods=['POST'])
 def search_and_analyze_endpoint():
-    """Simplified niche analysis with enhanced scoring"""
+    """Simplified niche analysis with median-based scoring"""
     data = request.json
     query = data.get('query')
     days = data.get('days', 7)
@@ -1662,7 +1791,7 @@ def search_and_analyze_endpoint():
                 'query': query
             })
         
-        # Analyze top related subreddits with enhanced scoring
+        # Analyze top related subreddits with median-based scoring
         results = []
         subreddits_to_analyze = related['related_subreddits'][:10]
         
@@ -1942,13 +2071,13 @@ def cache_status():
         'airtable_status': airtable_status,
         'reddit_user_agent': REDDIT_USER_AGENT,
         'timestamp': datetime.utcnow().isoformat(),
-        'scoring_version': 'v2_enhanced_tiers'
+        'scoring_version': 'v3_median_based'
     })
 
 # Health check endpoints
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'healthy', 'service': 'reddit-analyzer', 'scoring_version': 'v2_enhanced_tiers'})
+    return jsonify({'status': 'healthy', 'service': 'reddit-analyzer', 'scoring_version': 'v3_median_based'})
 
 @app.route('/ping', methods=['GET'])
 def ping():
