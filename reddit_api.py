@@ -173,15 +173,17 @@ class RedditAnalyzer:
     def calculate_effectiveness_v2(self, avg_posts_per_day: float, avg_score_per_post: float,
                                   avg_comments_per_post: float, subscribers: int, 
                                   post_scores: List[int] = None, is_nsfw: bool = False) -> Dict[str, Any]:
-        """Completely redesigned effectiveness scoring that's much more realistic"""
+        """Enhanced effectiveness scoring with additional upvote and comment tiers"""
         
-        # 1. ENGAGEMENT SCORE (50% weight) - Based on upvotes and comments
+        # 1. ENGAGEMENT SCORE (50% weight) - Enhanced with new tiers
         if is_nsfw:
-            # NSFW scoring: 10-15 = bad, 20-40 = medium, 40+ = good
-            if avg_score_per_post >= 60:
-                engagement_score = 95
-            elif avg_score_per_post >= 40:
-                engagement_score = 80  
+            # NSFW scoring with enhanced tiers
+            if avg_score_per_post >= 101:        # NEW: 101+ tier
+                engagement_score = 98
+            elif avg_score_per_post >= 60:       # NEW: 60-100 tier  
+                engagement_score = 85
+            elif avg_score_per_post >= 40:       # Adjusted existing tier
+                engagement_score = 75            # Reduced from 80
             elif avg_score_per_post >= 25:
                 engagement_score = 65
             elif avg_score_per_post >= 15:
@@ -191,11 +193,13 @@ class RedditAnalyzer:
             else:
                 engagement_score = 10
         else:
-            # Regular subreddit scoring - more generous than before
-            if avg_score_per_post >= 100:
-                engagement_score = 95
-            elif avg_score_per_post >= 50:
-                engagement_score = 80
+            # Regular subreddit scoring with enhanced tiers
+            if avg_score_per_post >= 101:        # NEW: 101+ tier
+                engagement_score = 98
+            elif avg_score_per_post >= 60:       # NEW: 60-100 tier  
+                engagement_score = 85
+            elif avg_score_per_post >= 50:       # Adjusted existing tier
+                engagement_score = 75            # Reduced from 80
             elif avg_score_per_post >= 25:
                 engagement_score = 65
             elif avg_score_per_post >= 15:
@@ -207,9 +211,11 @@ class RedditAnalyzer:
             else:
                 engagement_score = 10
         
-        # Comment bonus (up to 15 points)
-        if avg_comments_per_post >= 20:
-            comment_bonus = 15
+        # Enhanced Comment Bonus (up to 18 points)
+        if avg_comments_per_post >= 51:         # NEW: 51+ tier
+            comment_bonus = 18                  # Higher bonus
+        elif avg_comments_per_post >= 20:       # NEW: 20-50 tier
+            comment_bonus = 12                  # Reduced from 15
         elif avg_comments_per_post >= 10:
             comment_bonus = 10
         elif avg_comments_per_post >= 5:
@@ -221,45 +227,45 @@ class RedditAnalyzer:
         
         engagement_score = min(100, engagement_score + comment_bonus)
         
-        # 2. POSTING FREQUENCY SCORE (25% weight) - Lower is better
-        if avg_posts_per_day <= 0.5:  # Less than 1 post every 2 days
+        # 2. POSTING FREQUENCY SCORE (25% weight) - Same as before
+        if avg_posts_per_day <= 0.5:
             frequency_score = 100
-        elif avg_posts_per_day <= 1:    # 1 post per day
+        elif avg_posts_per_day <= 1:
             frequency_score = 90
-        elif avg_posts_per_day <= 2:    # 2 posts per day
+        elif avg_posts_per_day <= 2:
             frequency_score = 80
-        elif avg_posts_per_day <= 5:    # Up to 5 posts per day
+        elif avg_posts_per_day <= 5:
             frequency_score = 65
-        elif avg_posts_per_day <= 10:   # Up to 10 posts per day
+        elif avg_posts_per_day <= 10:
             frequency_score = 45
-        elif avg_posts_per_day <= 20:   # Up to 20 posts per day
+        elif avg_posts_per_day <= 20:
             frequency_score = 25
-        else:                            # More than 20 posts per day
+        else:
             frequency_score = 10
         
         # 3. CONSISTENCY SCORE (25% weight) - From post score analysis
         consistency_data = self.analyze_post_consistency(post_scores or [], is_nsfw)
         consistency_score = consistency_data['consistency_score']
         
-        # 4. SIZE ADJUSTMENT - Much less punitive than before
+        # 4. SIZE ADJUSTMENT - Same as before
         if subscribers < 1000:
-            size_modifier = 1.1      # Small subreddit bonus
+            size_modifier = 1.1
         elif subscribers < 10000:
-            size_modifier = 1.05     # Slight bonus
+            size_modifier = 1.05
         elif subscribers < 100000:
-            size_modifier = 1.0      # No penalty
+            size_modifier = 1.0
         elif subscribers < 500000:
-            size_modifier = 0.98     # Very slight penalty
+            size_modifier = 0.98
         elif subscribers < 1000000:
-            size_modifier = 0.95     # Small penalty  
+            size_modifier = 0.95
         else:
-            size_modifier = 0.92     # Larger subreddits get small penalty
+            size_modifier = 0.92
         
         # FINAL CALCULATION
         effectiveness = (
-            engagement_score * 0.50 +     # Primary factor: actual engagement
-            frequency_score * 0.25 +      # Secondary: posting frequency  
-            consistency_score * 0.25      # Secondary: consistency
+            engagement_score * 0.50 +
+            frequency_score * 0.25 +
+            consistency_score * 0.25
         ) * size_modifier
         
         final_score = min(100, max(0, effectiveness))
@@ -274,7 +280,7 @@ class RedditAnalyzer:
             },
             'consistency_data': consistency_data,
             'is_nsfw': is_nsfw,
-            'scoring_method': 'v2_realistic'
+            'scoring_method': 'v2_enhanced_tiers'
         }
 
     def analyze_subreddit_enhanced(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
@@ -373,7 +379,7 @@ class RedditAnalyzer:
                 'days_analyzed': days,
                 'posts_analyzed_for_scoring': len(post_scores),
                 'top_post': top_post,
-                'scoring_version': 'v2_realistic'
+                'scoring_version': 'v2_enhanced_tiers'
             }
             
             return result
@@ -417,7 +423,7 @@ class RedditAnalyzer:
                 'Days_Analyzed': analysis_data.get('days_analyzed', 7),
                 'Is_NSFW': analysis_data.get('is_nsfw', False),
                 'Posts_Analyzed_For_Scoring': analysis_data.get('posts_analyzed_for_scoring', 0),
-                'Scoring_Version': analysis_data.get('scoring_version', 'v2_realistic'),
+                'Scoring_Version': analysis_data.get('scoring_version', 'v2_enhanced_tiers'),
                 'Last_Analyzed': current_date
             }
             
@@ -1936,13 +1942,13 @@ def cache_status():
         'airtable_status': airtable_status,
         'reddit_user_agent': REDDIT_USER_AGENT,
         'timestamp': datetime.utcnow().isoformat(),
-        'scoring_version': 'v2_realistic'
+        'scoring_version': 'v2_enhanced_tiers'
     })
 
 # Health check endpoints
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'healthy', 'service': 'reddit-analyzer', 'scoring_version': 'v2_realistic'})
+    return jsonify({'status': 'healthy', 'service': 'reddit-analyzer', 'scoring_version': 'v2_enhanced_tiers'})
 
 @app.route('/ping', methods=['GET'])
 def ping():
