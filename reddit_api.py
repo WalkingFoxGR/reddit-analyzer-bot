@@ -59,7 +59,9 @@ class RedditAnalyzer:
             client_secret=REDDIT_CLIENT_SECRET,
             user_agent=REDDIT_USER_AGENT,
             ratelimit_seconds=300,
-            timeout=30
+            timeout=30,
+            connection_pool_size=10
+
         )
         
         # Cache for analysis results
@@ -305,7 +307,7 @@ class RedditAnalyzer:
             top_post_score = 0
             
             # Analyze new posts
-            for post in subreddit.new(limit=500):  # Increased limit for better consistency analysis
+            for post in subreddit.new(limit=300):  # Increased limit for better consistency analysis
                 post_date = datetime.utcfromtimestamp(post.created_utc)
                 if post_date < date_threshold:
                     break
