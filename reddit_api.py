@@ -14,6 +14,7 @@ import queue
 import pytz
 from pyairtable import Api
 import statistics
+from contextlib import contextmanager
 
 # Add this function BEFORE the Flask app initialization
 def safe_reddit_call(func, max_retries=3):
@@ -54,6 +55,14 @@ class RedditAnalyzer:
         else:
             logging.warning("Airtable credentials not found - running without caching")
         
+        # Add connection pool management
+        self.reddit_pool = []
+        self.pool_size = 3  # Number of Reddit instances
+        self.pool_lock = threading.Lock()
+        self.request_count = 0
+        self.last_reset = time.time()
+        
+        # Initialize main Reddit instance
         self.reddit = praw.Reddit(
             client_id=REDDIT_CLIENT_ID,
             client_secret=REDDIT_CLIENT_SECRET,
@@ -61,8 +70,20 @@ class RedditAnalyzer:
             ratelimit_seconds=300,
             timeout=30,
             connection_pool_size=10
-
         )
+        
+        # Initialize Reddit connection pool
+        for _ in range(self.pool_size):
+            reddit_instance = praw.Reddit(
+                client_id=REDDIT_CLIENT_ID,
+                client_secret=REDDIT_CLIENT_SECRET,
+                user_agent=REDDIT_USER_AGENT,
+                ratelimit_seconds=300,
+                timeout=30,  # Reduced from potential higher values
+                connection_pool_size=10,
+                max_retries=3
+            )
+            self.reddit_pool.append(reddit_instance)
         
         # Cache for analysis results
         self.analysis_cache = {}
@@ -76,11 +97,124 @@ class RedditAnalyzer:
             'showerthoughts', 'iama', 'all', 'popular', 'random'
         }
     
+    @contextmanager
+    def get_reddit_instance(self):
+        """Get a Reddit instance from the pool with automatic recovery"""
+        reddit = None
+        index = 0
+        try:
+            with self.pool_lock:
+                # Reset counter every hour
+                if time.time() - self.last_reset > 3600:
+                    self.request_count = 0
+                    self.last_reset = time.time()
+                
+                # Get instance from pool (round-robin)
+                index = self.request_count % self.pool_size
+                reddit = self.reddit_pool[index]
+                self.request_count += 1
+            
+            yield reddit
+            
+        except (RequestException, ResponseException, ConnectionResetError) as e:
+            logging.warning(f"Reddit connection error, recreating instance: {e}")
+            
+            # Recreate the problematic instance
+            with self.pool_lock:
+                try:
+                    new_reddit = praw.Reddit(
+                        client_id=REDDIT_CLIENT_ID,
+                        client_secret=REDDIT_CLIENT_SECRET,
+                        user_agent=REDDIT_USER_AGENT,
+                        ratelimit_seconds=300,
+                        timeout=30,
+                        connection_pool_size=10,
+                        max_retries=3
+                    )
+                    if reddit and index < len(self.reddit_pool):
+                        self.reddit_pool[index] = new_reddit
+                except Exception as create_error:
+                    logging.error(f"Failed to recreate Reddit instance: {create_error}")
+            
+            raise  # Re-raise the original error
+    
+    def enhanced_safe_reddit_call(self, func, max_retries=3, backoff_base=2):
+        """Enhanced wrapper with exponential backoff and connection recovery"""
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                # Add a small delay between attempts to avoid overwhelming the API
+                if attempt > 0:
+                    wait_time = backoff_base ** attempt
+                    logging.info(f"Retry attempt {attempt + 1}, waiting {wait_time}s")
+                    time.sleep(wait_time)
+                
+                with self.get_reddit_instance() as reddit:
+                    # Replace self.reddit with the pooled instance for this call
+                    original_reddit = self.reddit
+                    self.reddit = reddit
+                    try:
+                        result = func()
+                        return result
+                    finally:
+                        self.reddit = original_reddit
+                        
+            except ConnectionResetError as e:
+                logging.warning(f"Connection reset on attempt {attempt + 1}: {e}")
+                last_exception = e
+                if attempt < max_retries - 1:
+                    time.sleep(backoff_base ** (attempt + 1))
+                continue
+                
+            except RequestException as e:
+                logging.warning(f"Request exception on attempt {attempt + 1}: {e}")
+                last_exception = e
+                
+                # Check if it's a rate limit error
+                if hasattr(e, 'response') and e.response and e.response.status_code == 429:
+                    # Rate limited - wait longer
+                    wait_time = 60  # Wait a full minute for rate limits
+                    logging.info(f"Rate limited, waiting {wait_time}s")
+                    time.sleep(wait_time)
+                continue
+                
+            except ResponseException as e:
+                logging.warning(f"Response exception on attempt {attempt + 1}: {e}")
+                last_exception = e
+                
+                # Check for specific HTTP errors
+                if hasattr(e, 'response') and e.response:
+                    if e.response.status_code >= 500:
+                        # Server error - wait and retry
+                        time.sleep(backoff_base ** (attempt + 2))
+                    elif e.response.status_code == 404:
+                        # Not found - don't retry
+                        raise
+                continue
+                
+            except Exception as e:
+                logging.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+                last_exception = e
+                if "Read timed out" in str(e):
+                    # Timeout - can retry with longer timeout
+                    time.sleep(backoff_base ** (attempt + 1))
+                    continue
+                else:
+                    # Unknown error - don't retry
+                    raise
+        
+        # All retries exhausted
+        if last_exception:
+            raise last_exception
+        else:
+            raise Exception("All retry attempts failed")
+    
     def detect_nsfw_subreddit(self, subreddit_name: str, subreddit_obj=None) -> bool:
         """Detect if a subreddit is NSFW based on various indicators"""
         try:
             if not subreddit_obj:
-                subreddit_obj = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+                subreddit_obj = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
             # Check if subreddit is marked as NSFW
             if hasattr(subreddit_obj, 'over18') and subreddit_obj.over18:
@@ -282,8 +416,19 @@ class RedditAnalyzer:
     def analyze_subreddit_enhanced(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """Enhanced analysis with consistency measurement and realistic scoring"""
         try:
-            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
-            subscribers = subreddit.subscribers
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            # Check if subreddit is accessible
+            try:
+                subscribers = self.enhanced_safe_reddit_call(lambda: subreddit.subscribers)
+            except Exception as e:
+                if "Redirect" in str(e) or "404" in str(e):
+                    return {'success': False, 'error': f'Subreddit r/{subreddit_name} not found'}
+                elif "403" in str(e) or "private" in str(e).lower():
+                    return {'success': False, 'error': f'Subreddit r/{subreddit_name} is private'}
+                else:
+                    raise
+                    
             date_threshold = datetime.utcnow() - timedelta(days=days)
             
             # Detect if NSFW
@@ -306,7 +451,7 @@ class RedditAnalyzer:
             top_post = None
             top_post_score = 0
             
-            # Analyze new posts
+            # Analyze new posts with enhanced error handling
             for post in subreddit.new(limit=300):  # Increased limit for better consistency analysis
                 post_date = datetime.utcfromtimestamp(post.created_utc)
                 if post_date < date_threshold:
@@ -344,8 +489,14 @@ class RedditAnalyzer:
                         'flair': post.link_flair_text or 'No Flair'
                     }
                 
-                if post_count % 50 == 0:
+                # Add periodic sleeps for large operations
+                if post_count % 25 == 0:
                     time.sleep(0.5)
+                
+                # Longer pause every 100 posts
+                if post_count % 100 == 0:
+                    time.sleep(2)
+                    logging.info(f"Processed {post_count} posts for r/{subreddit_name}")
             
             # Also check top posts to ensure we get the actual top post
             try:
@@ -578,7 +729,7 @@ class RedditAnalyzer:
     def analyze_posting_times(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """Analyze best posting times for a subreddit"""
         try:
-            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
             # Data structures for time analysis
             hourly_scores = defaultdict(list)
@@ -682,7 +833,7 @@ class RedditAnalyzer:
     def check_verification_requirements(self, subreddit_name: str) -> Dict[str, Any]:
         """Enhanced verification detection - checks rules AND recent policy changes"""
         try:
-            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
             # Check 1: Subreddit rules
             rules_verification = False
@@ -850,7 +1001,7 @@ class RedditAnalyzer:
         # Analyze if not cached or cache failed
         try:
             logging.info(f"Starting karma analysis for {subreddit_name} with {post_limit} posts")
-            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
             min_post_karma = float('inf')
             min_comment_karma = float('inf')
@@ -865,7 +1016,7 @@ class RedditAnalyzer:
                         continue
                     
                     users_analyzed.add(post.author.name)
-                    user = safe_reddit_call(lambda: self.reddit.redditor(post.author.name))
+                    user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(post.author.name))
                     
                     post_karma = getattr(user, 'link_karma', 0)
                     comment_karma = getattr(user, 'comment_karma', 0)
@@ -964,7 +1115,7 @@ class RedditAnalyzer:
     def detect_fake_upvotes(self, subreddit_name: str) -> Dict[str, Any]:
         """Detect potential fake upvote patterns"""
         try:
-            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
             # Collect post data
             post_scores = []
@@ -1036,7 +1187,7 @@ class RedditAnalyzer:
             fake_upvotes = self.detect_fake_upvotes(subreddit_name)
             
             # Get basic subreddit info
-            subreddit = safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
             return {
                 'success': True,
@@ -1061,7 +1212,7 @@ class RedditAnalyzer:
             
             # Get the seed subreddit
             try:
-                subreddit = safe_reddit_call(lambda: self.reddit.subreddit(seed_subreddit))
+                subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(seed_subreddit))
                 seed_info = {
                     'name': subreddit.display_name,
                     'subscribers': subreddit.subscribers
@@ -1104,7 +1255,7 @@ class RedditAnalyzer:
                 users_analyzed.add(username)
                 
                 try:
-                    user = safe_reddit_call(lambda: self.reddit.redditor(username))
+                    user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(username))
                     
                     # Analyze user's recent activity
                     user_subs = set()
@@ -1146,7 +1297,7 @@ class RedditAnalyzer:
             detailed_results = []
             for sub_name, overlap_score in sorted_subs:
                 try:
-                    sub = safe_reddit_call(lambda: self.reddit.subreddit(sub_name))
+                    sub = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(sub_name))
                     
                     # Calculate user overlap percentage
                     users_in_both = sum(1 for user_subs in user_subreddits.values() if sub_name in user_subs)
@@ -1238,7 +1389,7 @@ class RedditAnalyzer:
     def analyze_user(self, username: str, days: int = 30, limit: int = 100) -> Dict[str, Any]:
         """Analyze a Reddit user's posting activity and performance"""
         try:
-            user = safe_reddit_call(lambda: self.reddit.redditor(username))
+            user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(username))
             
             # Get basic user info
             try:
@@ -1402,12 +1553,12 @@ analysis_sessions = {}
 def validate_subreddit(subreddit_name: str) -> Dict[str, Any]:
     """Validate if a subreddit exists and is accessible"""
     try:
-        subreddit = safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
+        subreddit = analyzer.enhanced_safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
         # Try to access a basic attribute to trigger the API call
-        _ = safe_reddit_call(lambda: subreddit.display_name)
+        _ = analyzer.enhanced_safe_reddit_call(lambda: subreddit.display_name)
         # Check if it's private/banned by trying to access subscribers
         try:
-            subscribers = safe_reddit_call(lambda: subreddit.subscribers)
+            subscribers = analyzer.enhanced_safe_reddit_call(lambda: subreddit.subscribers)
             if subscribers is None:
                 return {
                     'valid': False,
@@ -1516,13 +1667,13 @@ def analyze_user_endpoint():
     
     # Validate user exists
     try:
-        user = safe_reddit_call(lambda: analyzer.reddit.redditor(username))
+        user = analyzer.enhanced_safe_reddit_call(lambda: analyzer.reddit.redditor(username))
         # Try to access a basic attribute to check if user exists
-        _ = safe_reddit_call(lambda: user.name)
+        _ = analyzer.enhanced_safe_reddit_call(lambda: user.name)
         
         # Check if user is suspended/banned
         try:
-            _ = safe_reddit_call(lambda: user.created_utc)
+            _ = analyzer.enhanced_safe_reddit_call(lambda: user.created_utc)
         except Exception as e:
             if 'suspended' in str(e).lower() or 'banned' in str(e).lower():
                 return jsonify({
@@ -1805,7 +1956,7 @@ def scrape_posts():
         return jsonify({'success': False, 'error': f'Invalid time filter. Use: {", ".join(valid_time_filters)}'}), 400
     
     try:
-        subreddit = safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
+        subreddit = analyzer.enhanced_safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
         posts = []
         
         # Get posts based on sort type
@@ -1880,7 +2031,7 @@ def get_subreddit_rules():
         }), 400
     
     try:
-        subreddit = safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
+        subreddit = analyzer.enhanced_safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
         rules = []
         
         for rule in subreddit.rules:
@@ -1920,7 +2071,7 @@ def analyze_flairs():
         }), 400
     
     try:
-        subreddit = safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
+        subreddit = analyzer.enhanced_safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
         flair_stats = {}
         
         # Store sample posts for each flair
@@ -2016,6 +2167,48 @@ def cache_status():
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'healthy', 'service': 'reddit-analyzer', 'scoring_version': 'v2_realistic'})
+
+@app.route('/health-detailed', methods=['GET'])
+def health_check_detailed():
+    """Detailed health check with connection pool status"""
+    try:
+        # Test Reddit connection
+        reddit_status = "healthy"
+        try:
+            test_sub = analyzer.enhanced_safe_reddit_call(
+                lambda: analyzer.reddit.subreddit('python').subscribers
+            )
+            if not test_sub:
+                reddit_status = "degraded"
+        except Exception as e:
+            reddit_status = f"unhealthy: {str(e)[:50]}"
+        
+        # Check Airtable connection
+        airtable_status = "disconnected"
+        if analyzer.airtable:
+            try:
+                # Simple test query
+                analyzer.karma_table.all(max_records=1)
+                airtable_status = "healthy"
+            except Exception as e:
+                airtable_status = f"error: {str(e)[:50]}"
+        
+        return jsonify({
+            'status': 'healthy' if reddit_status == 'healthy' else 'degraded',
+            'reddit_api': reddit_status,
+            'airtable': airtable_status,
+            'connection_pool_size': len(analyzer.reddit_pool),
+            'request_count': analyzer.request_count,
+            'timestamp': datetime.utcnow().isoformat(),
+            'uptime_hours': round((time.time() - analyzer.last_reset) / 3600, 2)
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
 
 @app.route('/ping', methods=['GET'])
 def ping():
