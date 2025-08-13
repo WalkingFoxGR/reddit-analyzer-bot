@@ -14,22 +14,8 @@ import queue
 import pytz
 from pyairtable import Api
 import statistics
-from contextlib import contextmanager
+from contextmanager import contextmanager
 from threading import Semaphore
-
-# Add this function BEFORE the Flask app initialization
-def safe_reddit_call(func, max_retries=3):
-    """Wrapper to retry Reddit API calls"""
-    for i in range(max_retries):
-        try:
-            return func()
-        except (RequestException, ResponseException) as e:
-            if i < max_retries - 1:
-                wait_time = 2 ** i  # Exponential backoff: 1, 2, 4 seconds
-                logging.warning(f"Reddit API error, retrying in {wait_time}s: {e}")
-                time.sleep(wait_time)
-            else:
-                raise
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -56,38 +42,29 @@ class RedditAnalyzer:
         else:
             logging.warning("Airtable credentials not found - running without caching")
         
-        # Add connection pool management
+        # Enhanced connection pool management
         self.reddit_pool = []
-        self.pool_size = 3  # Number of Reddit instances
+        self.pool_size = 3
         self.pool_lock = threading.Lock()
+        self.pool_last_used = {}  # Track when each connection was last used
+        self.pool_creation_time = {}  # Track when each connection was created
         self.request_count = 0
         self.last_reset = time.time()
+        self.max_connection_age = 300  # Max 5 minutes per connection
+        self.max_idle_time = 60  # Max 1 minute idle before refresh
         
         # Add request semaphore to limit concurrent requests
         self.request_semaphore = Semaphore(5)  # Max 5 concurrent Reddit requests
         
         # Initialize main Reddit instance
-        self.reddit = praw.Reddit(
-            client_id=REDDIT_CLIENT_ID,
-            client_secret=REDDIT_CLIENT_SECRET,
-            user_agent=REDDIT_USER_AGENT,
-            ratelimit_seconds=300,
-            timeout=30,
-            connection_pool_size=10
-        )
+        self.reddit = self._create_reddit_instance()
         
-        # Initialize Reddit connection pool
-        for _ in range(self.pool_size):
-            reddit_instance = praw.Reddit(
-                client_id=REDDIT_CLIENT_ID,
-                client_secret=REDDIT_CLIENT_SECRET,
-                user_agent=REDDIT_USER_AGENT,
-                ratelimit_seconds=300,
-                timeout=30,  # Reduced from potential higher values
-                connection_pool_size=10,
-                max_retries=3
-            )
+        # Initialize Reddit connection pool with tracking
+        for i in range(self.pool_size):
+            reddit_instance = self._create_reddit_instance()
             self.reddit_pool.append(reddit_instance)
+            self.pool_last_used[i] = time.time()
+            self.pool_creation_time[i] = time.time()
         
         # Cache for analysis results
         self.analysis_cache = {}
@@ -104,6 +81,18 @@ class RedditAnalyzer:
         # Test connection on initialization
         self.test_connection()
     
+    def _create_reddit_instance(self):
+        """Create a fresh Reddit instance"""
+        return praw.Reddit(
+            client_id=REDDIT_CLIENT_ID,
+            client_secret=REDDIT_CLIENT_SECRET,
+            user_agent=REDDIT_USER_AGENT,
+            ratelimit_seconds=300,
+            timeout=30,
+            connection_pool_size=5,  # Reduced from 10
+            max_retries=2  # Reduced from 3
+        )
+    
     def test_connection(self):
         """Test Reddit connection on initialization"""
         try:
@@ -112,74 +101,85 @@ class RedditAnalyzer:
         except Exception as e:
             logging.error(f"Reddit connection test failed: {e}")
             # Try to recreate connection
-            self.reddit = praw.Reddit(
-                client_id=REDDIT_CLIENT_ID,
-                client_secret=REDDIT_CLIENT_SECRET,
-                user_agent=REDDIT_USER_AGENT,
-                ratelimit_seconds=300,
-                timeout=30,
-                connection_pool_size=10
-            )
+            self.reddit = self._create_reddit_instance()
     
     @contextmanager
     def get_reddit_instance(self):
-        """Get a Reddit instance from the pool with automatic recovery"""
+        """Get a Reddit instance with automatic refresh for stale connections"""
         reddit = None
         index = 0
         try:
             with self.pool_lock:
-                # Reset counter every hour
-                if time.time() - self.last_reset > 3600:
-                    self.request_count = 0
-                    self.last_reset = time.time()
+                current_time = time.time()
                 
-                # Get instance from pool (round-robin)
+                # Get instance index (round-robin)
                 index = self.request_count % self.pool_size
-                reddit = self.reddit_pool[index]
                 self.request_count += 1
+                
+                # Check if connection needs refresh
+                last_used = self.pool_last_used.get(index, 0)
+                creation_time = self.pool_creation_time.get(index, 0)
+                
+                # Refresh if connection is too old or idle too long
+                if (current_time - creation_time > self.max_connection_age or
+                    current_time - last_used > self.max_idle_time):
+                    
+                    logging.info(f"Refreshing stale connection {index} (age: {current_time - creation_time:.0f}s, idle: {current_time - last_used:.0f}s)")
+                    
+                    # Close old connection properly
+                    try:
+                        old_reddit = self.reddit_pool[index]
+                        if hasattr(old_reddit, '_core') and hasattr(old_reddit._core, '_requestor'):
+                            old_reddit._core._requestor._http.close()
+                    except:
+                        pass
+                    
+                    # Create fresh connection
+                    self.reddit_pool[index] = self._create_reddit_instance()
+                    self.pool_creation_time[index] = current_time
+                
+                # Update last used time
+                self.pool_last_used[index] = current_time
+                reddit = self.reddit_pool[index]
             
             yield reddit
             
         except (RequestException, ResponseException, ConnectionResetError) as e:
-            logging.warning(f"Reddit connection error, recreating instance: {e}")
+            logging.warning(f"Connection error on pool {index}, forcing refresh: {e}")
             
-            # Recreate the problematic instance
+            # Force refresh this connection
             with self.pool_lock:
                 try:
-                    new_reddit = praw.Reddit(
-                        client_id=REDDIT_CLIENT_ID,
-                        client_secret=REDDIT_CLIENT_SECRET,
-                        user_agent=REDDIT_USER_AGENT,
-                        ratelimit_seconds=300,
-                        timeout=30,
-                        connection_pool_size=10,
-                        max_retries=3
-                    )
-                    if reddit and index < len(self.reddit_pool):
-                        self.reddit_pool[index] = new_reddit
+                    self.reddit_pool[index] = self._create_reddit_instance()
+                    self.pool_creation_time[index] = time.time()
+                    self.pool_last_used[index] = time.time()
                 except Exception as create_error:
                     logging.error(f"Failed to recreate Reddit instance: {create_error}")
             
-            raise  # Re-raise the original error
+            raise
     
     def enhanced_safe_reddit_call(self, func, max_retries=3, backoff_base=2):
-        """Enhanced wrapper with exponential backoff and connection recovery"""
+        """Enhanced wrapper with better error handling"""
         with self.request_semaphore:  # Limit concurrent requests
             last_exception = None
             
             for attempt in range(max_retries):
                 try:
-                    # Add a small delay between attempts to avoid overwhelming the API
+                    # Add delay between retries
                     if attempt > 0:
-                        wait_time = backoff_base ** attempt
+                        wait_time = min(backoff_base ** attempt, 30)  # Cap at 30 seconds
                         logging.info(f"Retry attempt {attempt + 1}, waiting {wait_time}s")
                         time.sleep(wait_time)
                     
                     with self.get_reddit_instance() as reddit:
-                        # Replace self.reddit with the pooled instance for this call
+                        # Execute with fresh connection
                         original_reddit = self.reddit
                         self.reddit = reddit
                         try:
+                            # Add small delay to prevent hammering
+                            if attempt == 0:
+                                time.sleep(0.1)  # 100ms delay between requests
+                            
                             result = func()
                             return result
                         finally:
@@ -188,42 +188,49 @@ class RedditAnalyzer:
                 except ConnectionResetError as e:
                     logging.warning(f"Connection reset on attempt {attempt + 1}: {e}")
                     last_exception = e
+                    # Don't retry immediately for connection resets
                     if attempt < max_retries - 1:
-                        time.sleep(backoff_base ** (attempt + 1))
+                        time.sleep(2)
                     continue
                     
                 except RequestException as e:
                     logging.warning(f"Request exception on attempt {attempt + 1}: {e}")
                     last_exception = e
                     
-                    # Check if it's a rate limit error
-                    if hasattr(e, 'response') and e.response and e.response.status_code == 429:
-                        # Rate limited - wait longer
-                        wait_time = 60  # Wait a full minute for rate limits
-                        logging.info(f"Rate limited, waiting {wait_time}s")
-                        time.sleep(wait_time)
+                    # Check for rate limiting
+                    if hasattr(e, 'response') and e.response:
+                        if e.response.status_code == 429:
+                            # Rate limited - wait longer
+                            wait_time = 60
+                            logging.info(f"Rate limited, waiting {wait_time}s")
+                            time.sleep(wait_time)
+                        elif e.response.status_code == 404:
+                            # Not found - don't retry
+                            raise
                     continue
                     
                 except ResponseException as e:
                     logging.warning(f"Response exception on attempt {attempt + 1}: {e}")
                     last_exception = e
                     
-                    # Check for specific HTTP errors
+                    # Check for redirect (subreddit doesn't exist)
+                    if "Redirect" in str(e):
+                        # Don't retry for non-existent subreddits
+                        raise
+                        
+                    # Server error - retry with backoff
                     if hasattr(e, 'response') and e.response:
                         if e.response.status_code >= 500:
-                            # Server error - wait and retry
-                            time.sleep(backoff_base ** (attempt + 2))
-                        elif e.response.status_code == 404:
-                            # Not found - don't retry
-                            raise
+                            time.sleep(backoff_base ** (attempt + 1))
                     continue
                     
                 except Exception as e:
                     logging.error(f"Unexpected error on attempt {attempt + 1}: {e}")
                     last_exception = e
+                    
                     if "Read timed out" in str(e):
-                        # Timeout - can retry with longer timeout
-                        time.sleep(backoff_base ** (attempt + 1))
+                        # Timeout - retry with longer delay
+                        time.sleep(5)
                         continue
                     else:
                         # Unknown error - don't retry
@@ -234,7 +241,7 @@ class RedditAnalyzer:
                 raise last_exception
             else:
                 raise Exception("All retry attempts failed")
-    
+
     def detect_nsfw_subreddit(self, subreddit_name: str, subreddit_obj=None) -> bool:
         """Detect if a subreddit is NSFW based on various indicators"""
         try:
@@ -1624,6 +1631,23 @@ def validate_subreddit(subreddit_name: str) -> Dict[str, Any]:
                 'message': f'Error accessing r/{subreddit_name}: {str(e)}'
             }
 
+# Connection pool health check
+def connection_pool_health_check():
+    """Run this periodically to check pool health"""
+    with analyzer.pool_lock:
+        current_time = time.time()
+        for i in range(analyzer.pool_size):
+            age = current_time - analyzer.pool_creation_time.get(i, 0)
+            idle = current_time - analyzer.pool_last_used.get(i, 0)
+            logging.info(f"Pool {i}: age={age:.0f}s, idle={idle:.0f}s")
+            
+            # Force refresh very old connections
+            if age > 600:  # 10 minutes
+                logging.info(f"Force refreshing old connection {i}")
+                analyzer.reddit_pool[i] = analyzer._create_reddit_instance()
+                analyzer.pool_creation_time[i] = current_time
+                analyzer.pool_last_used[i] = current_time
+
 # ==== ENDPOINTS ====
 
 @app.route('/analyze', methods=['POST'])
@@ -2163,7 +2187,7 @@ def cleanup_cache():
     for key in expired_keys:
         del analyzer.analysis_cache[key]
 
-# Add this route for health monitoring
+# Add this route for cache monitoring
 @app.route('/cache-status', methods=['GET'])
 def cache_status():
     """Check cache status and memory usage"""
@@ -2187,6 +2211,29 @@ def cache_status():
         'timestamp': datetime.utcnow().isoformat(),
         'scoring_version': 'v2_realistic',
         'semaphore_permits': analyzer.request_semaphore._value
+    })
+
+# Connection pool status endpoint
+@app.route('/pool-status', methods=['GET'])
+def pool_status():
+    """Check connection pool status"""
+    connection_pool_health_check()
+    
+    with analyzer.pool_lock:
+        current_time = time.time()
+        pool_info = []
+        for i in range(analyzer.pool_size):
+            pool_info.append({
+                'index': i,
+                'age': round(current_time - analyzer.pool_creation_time.get(i, 0)),
+                'idle': round(current_time - analyzer.pool_last_used.get(i, 0))
+            })
+    
+    return jsonify({
+        'pool_size': analyzer.pool_size,
+        'request_count': analyzer.request_count,
+        'connections': pool_info,
+        'timestamp': datetime.utcnow().isoformat()
     })
 
 # Health check endpoints
