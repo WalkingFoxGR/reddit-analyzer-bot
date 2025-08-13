@@ -15,6 +15,7 @@ import pytz
 from pyairtable import Api
 import statistics
 from contextlib import contextmanager
+from threading import Semaphore
 
 # Add this function BEFORE the Flask app initialization
 def safe_reddit_call(func, max_retries=3):
@@ -62,6 +63,9 @@ class RedditAnalyzer:
         self.request_count = 0
         self.last_reset = time.time()
         
+        # Add request semaphore to limit concurrent requests
+        self.request_semaphore = Semaphore(5)  # Max 5 concurrent Reddit requests
+        
         # Initialize main Reddit instance
         self.reddit = praw.Reddit(
             client_id=REDDIT_CLIENT_ID,
@@ -96,6 +100,26 @@ class RedditAnalyzer:
             'television', 'books', 'art', 'food', 'jokes', 'tifu',
             'showerthoughts', 'iama', 'all', 'popular', 'random'
         }
+        
+        # Test connection on initialization
+        self.test_connection()
+    
+    def test_connection(self):
+        """Test Reddit connection on initialization"""
+        try:
+            test = self.reddit.subreddit('python').subscribers
+            logging.info(f"Reddit connection test successful: {test} subscribers")
+        except Exception as e:
+            logging.error(f"Reddit connection test failed: {e}")
+            # Try to recreate connection
+            self.reddit = praw.Reddit(
+                client_id=REDDIT_CLIENT_ID,
+                client_secret=REDDIT_CLIENT_SECRET,
+                user_agent=REDDIT_USER_AGENT,
+                ratelimit_seconds=300,
+                timeout=30,
+                connection_pool_size=10
+            )
     
     @contextmanager
     def get_reddit_instance(self):
@@ -140,75 +164,76 @@ class RedditAnalyzer:
     
     def enhanced_safe_reddit_call(self, func, max_retries=3, backoff_base=2):
         """Enhanced wrapper with exponential backoff and connection recovery"""
-        last_exception = None
-        
-        for attempt in range(max_retries):
-            try:
-                # Add a small delay between attempts to avoid overwhelming the API
-                if attempt > 0:
-                    wait_time = backoff_base ** attempt
-                    logging.info(f"Retry attempt {attempt + 1}, waiting {wait_time}s")
-                    time.sleep(wait_time)
-                
-                with self.get_reddit_instance() as reddit:
-                    # Replace self.reddit with the pooled instance for this call
-                    original_reddit = self.reddit
-                    self.reddit = reddit
-                    try:
-                        result = func()
-                        return result
-                    finally:
-                        self.reddit = original_reddit
-                        
-            except ConnectionResetError as e:
-                logging.warning(f"Connection reset on attempt {attempt + 1}: {e}")
-                last_exception = e
-                if attempt < max_retries - 1:
-                    time.sleep(backoff_base ** (attempt + 1))
-                continue
-                
-            except RequestException as e:
-                logging.warning(f"Request exception on attempt {attempt + 1}: {e}")
-                last_exception = e
-                
-                # Check if it's a rate limit error
-                if hasattr(e, 'response') and e.response and e.response.status_code == 429:
-                    # Rate limited - wait longer
-                    wait_time = 60  # Wait a full minute for rate limits
-                    logging.info(f"Rate limited, waiting {wait_time}s")
-                    time.sleep(wait_time)
-                continue
-                
-            except ResponseException as e:
-                logging.warning(f"Response exception on attempt {attempt + 1}: {e}")
-                last_exception = e
-                
-                # Check for specific HTTP errors
-                if hasattr(e, 'response') and e.response:
-                    if e.response.status_code >= 500:
-                        # Server error - wait and retry
-                        time.sleep(backoff_base ** (attempt + 2))
-                    elif e.response.status_code == 404:
-                        # Not found - don't retry
-                        raise
-                continue
-                
-            except Exception as e:
-                logging.error(f"Unexpected error on attempt {attempt + 1}: {e}")
-                last_exception = e
-                if "Read timed out" in str(e):
-                    # Timeout - can retry with longer timeout
-                    time.sleep(backoff_base ** (attempt + 1))
+        with self.request_semaphore:  # Limit concurrent requests
+            last_exception = None
+            
+            for attempt in range(max_retries):
+                try:
+                    # Add a small delay between attempts to avoid overwhelming the API
+                    if attempt > 0:
+                        wait_time = backoff_base ** attempt
+                        logging.info(f"Retry attempt {attempt + 1}, waiting {wait_time}s")
+                        time.sleep(wait_time)
+                    
+                    with self.get_reddit_instance() as reddit:
+                        # Replace self.reddit with the pooled instance for this call
+                        original_reddit = self.reddit
+                        self.reddit = reddit
+                        try:
+                            result = func()
+                            return result
+                        finally:
+                            self.reddit = original_reddit
+                            
+                except ConnectionResetError as e:
+                    logging.warning(f"Connection reset on attempt {attempt + 1}: {e}")
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        time.sleep(backoff_base ** (attempt + 1))
                     continue
-                else:
-                    # Unknown error - don't retry
-                    raise
-        
-        # All retries exhausted
-        if last_exception:
-            raise last_exception
-        else:
-            raise Exception("All retry attempts failed")
+                    
+                except RequestException as e:
+                    logging.warning(f"Request exception on attempt {attempt + 1}: {e}")
+                    last_exception = e
+                    
+                    # Check if it's a rate limit error
+                    if hasattr(e, 'response') and e.response and e.response.status_code == 429:
+                        # Rate limited - wait longer
+                        wait_time = 60  # Wait a full minute for rate limits
+                        logging.info(f"Rate limited, waiting {wait_time}s")
+                        time.sleep(wait_time)
+                    continue
+                    
+                except ResponseException as e:
+                    logging.warning(f"Response exception on attempt {attempt + 1}: {e}")
+                    last_exception = e
+                    
+                    # Check for specific HTTP errors
+                    if hasattr(e, 'response') and e.response:
+                        if e.response.status_code >= 500:
+                            # Server error - wait and retry
+                            time.sleep(backoff_base ** (attempt + 2))
+                        elif e.response.status_code == 404:
+                            # Not found - don't retry
+                            raise
+                    continue
+                    
+                except Exception as e:
+                    logging.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+                    last_exception = e
+                    if "Read timed out" in str(e):
+                        # Timeout - can retry with longer timeout
+                        time.sleep(backoff_base ** (attempt + 1))
+                        continue
+                    else:
+                        # Unknown error - don't retry
+                        raise
+            
+            # All retries exhausted
+            if last_exception:
+                raise last_exception
+            else:
+                raise Exception("All retry attempts failed")
     
     def detect_nsfw_subreddit(self, subreddit_name: str, subreddit_obj=None) -> bool:
         """Detect if a subreddit is NSFW based on various indicators"""
@@ -2160,7 +2185,8 @@ def cache_status():
         'airtable_status': airtable_status,
         'reddit_user_agent': REDDIT_USER_AGENT,
         'timestamp': datetime.utcnow().isoformat(),
-        'scoring_version': 'v2_realistic'
+        'scoring_version': 'v2_realistic',
+        'semaphore_permits': analyzer.request_semaphore._value
     })
 
 # Health check endpoints
@@ -2199,6 +2225,7 @@ def health_check_detailed():
             'airtable': airtable_status,
             'connection_pool_size': len(analyzer.reddit_pool),
             'request_count': analyzer.request_count,
+            'semaphore_permits_available': analyzer.request_semaphore._value,
             'timestamp': datetime.utcnow().isoformat(),
             'uptime_hours': round((time.time() - analyzer.last_reset) / 3600, 2)
         })
