@@ -44,7 +44,7 @@ class RedditAnalyzer:
         
         # Enhanced connection pool management
         self.reddit_pool = []
-        self.pool_size = 3
+        self.pool_size = 5
         self.pool_lock = threading.Lock()
         self.pool_last_used = {}  # Track when each connection was last used
         self.pool_creation_time = {}  # Track when each connection was created
