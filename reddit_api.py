@@ -33,27 +33,9 @@ class RedditAnalyzer:
         
         if api_key and base_id:
             try:
-                # Create session with connection pooling
-                import requests
-                from requests.adapters import HTTPAdapter
-                from urllib3.util.retry import Retry
-                
-                session = requests.Session()
-                retry = Retry(
-                    total=3,
-                    read=3,
-                    connect=3,
-                    backoff_factor=0.3,
-                    status_forcelist=(500, 502, 504)
-                )
-                adapter = HTTPAdapter(max_retries=retry)
-                session.mount('http://', adapter)
-                session.mount('https://', adapter)
-                self.airtable = Api(api_key, request_kwargs={'session': session})
+                self.airtable = Api(api_key)
                 self.karma_table = self.airtable.table(base_id, 'Karma Requirements')
-                self.airtable_semaphore = Semaphore(3)  # Max 3 concurrent Airtable operations
-                self.last_airtable_request = 0
-                logging.info("Airtable initialized successfully with connection pooling")
+                logging.info("Airtable initialized successfully")
             except Exception as e:
                 logging.error(f"Failed to initialize Airtable: {e}")
                 self.airtable = None
@@ -111,174 +93,6 @@ class RedditAnalyzer:
             max_retries=2  # Reduced from 3
         )
     
-    def safe_airtable_operation(self, operation, *args, **kwargs):
-        """Execute Airtable operation with rate limiting and retry"""
-        if not self.airtable:
-            return None
-            
-        with self.airtable_semaphore:
-            # Rate limit: ensure 200ms between requests (5 per second max)
-            current_time = time.time()
-            time_since_last = current_time - self.last_airtable_request
-            if time_since_last < 0.2:
-                time.sleep(0.2 - time_since_last)
-            
-            try:
-                result = operation(*args, **kwargs)
-                self.last_airtable_request = time.time()
-                return result
-            except Exception as e:
-                if "Connection reset" in str(e) or "ConnectionResetError" in str(e):
-                    logging.warning(f"Airtable connection reset, retrying: {e}")
-                    time.sleep(1)
-                    try:
-                        result = operation(*args, **kwargs)
-                        self.last_airtable_request = time.time()
-                        return result
-                    except Exception as retry_error:
-                        logging.error(f"Airtable retry failed: {retry_error}")
-                        return None
-                else:
-                    logging.error(f"Airtable operation failed: {e}")
-                    return None
-
-    def save_analyze_to_airtable(self, analysis_data: Dict[str, Any]) -> bool:
-        """Save enhanced analyze metrics to Airtable with safe wrapper"""
-        if not self.airtable:
-            logging.warning("Airtable not initialized, skipping save")
-            return False
-        
-        try:
-            subreddit_name = analysis_data['subreddit']
-            
-            # Use safe wrapper for Airtable operations
-            existing = self.safe_airtable_operation(
-                self.karma_table.all,
-                formula=f"{{Subreddit}}='{subreddit_name}'"
-            )
-            
-            if existing is None:
-                logging.warning("Failed to check existing records")
-                return False
-            
-            current_date = datetime.utcnow().strftime('%Y-%m-%d')
-            
-            # Prepare the record data with enhanced metrics
-            record_data = {
-                'Subreddit': subreddit_name,
-                'Subscribers': analysis_data.get('subscribers', 0),
-                'Effectiveness_Score': analysis_data.get('effectiveness_score', 0),
-                'Avg_Posts_Per_Day': analysis_data.get('avg_posts_per_day', 0),
-                'Avg_Score_Per_Post': analysis_data.get('avg_score_per_post', 0),
-                'Median_Score_Per_Post': analysis_data.get('median_score_per_post', 0),
-                'Trimmed_Mean_Score': analysis_data.get('trimmed_mean_score', 0),
-                'Avg_Comments_Per_Post': analysis_data.get('avg_comments_per_post', 0),
-                'Days_Analyzed': analysis_data.get('days_analyzed', 7),
-                'Is_NSFW': analysis_data.get('is_nsfw', False),
-                'Posts_Analyzed_For_Scoring': analysis_data.get('posts_analyzed_for_scoring', 0),
-                'Scoring_Version': analysis_data.get('scoring_version', 'v2_realistic'),
-                'Last_Analyzed': current_date,
-                # High performer data
-                'High_Performers_100_Plus': analysis_data.get('high_performers', {}).get('100+', 0),
-                'High_Performers_200_Plus': analysis_data.get('high_performers', {}).get('200+', 0),
-                'High_Performers_500_Plus': analysis_data.get('high_performers', {}).get('500+', 0),
-                'High_Performer_Percentage': analysis_data.get('high_performer_percentage', 0),
-                'Reach_Description': analysis_data.get('reach_description', ''),
-                'Has_High_Variance': analysis_data.get('has_high_variance', False)
-            }
-            
-            # Add consistency data
-            if analysis_data.get('consistency_analysis'):
-                consistency = analysis_data['consistency_analysis']
-                record_data.update({
-                    'Consistency_Score': consistency.get('consistency_score', 0),
-                    'Good_Posts_Ratio': consistency.get('good_posts_ratio', 0),
-                    'Great_Posts_Ratio': consistency.get('great_posts_ratio', 0),
-                    'Distribution_Pattern': consistency.get('distribution', ''),
-                    'Good_Threshold': consistency.get('good_threshold', 0),
-                    'Great_Threshold': consistency.get('great_threshold', 0)
-                })
-            
-            # Add effectiveness breakdown
-            if analysis_data.get('effectiveness_breakdown'):
-                breakdown = analysis_data['effectiveness_breakdown']
-                record_data.update({
-                    'Engagement_Score': breakdown.get('engagement_score', 0),
-                    'Frequency_Score': breakdown.get('frequency_score', 0),
-                    'Consistency_Component': breakdown.get('consistency_score', 0),
-                    'Size_Modifier': breakdown.get('size_modifier', 1.0)
-                })
-            
-            # Add top post data if available
-            if analysis_data.get('top_post'):
-                top_post = analysis_data['top_post']
-                record_data.update({
-                    'Top_Post_Title': top_post.get('title', '')[:500],
-                    'Top_Post_Score': top_post.get('score', 0),
-                    'Top_Post_Author': top_post.get('author', ''),
-                    'Top_Post_Comments': top_post.get('comments', 0),
-                    'Top_Post_URL': top_post.get('url', ''),
-                    'Top_Post_Flair': top_post.get('flair', '')
-                })
-            
-            # Add posting times data if available
-            if analysis_data.get('posting_times'):
-                posting_times = analysis_data['posting_times']
-                
-                # Best hour (just the #1)
-                if posting_times.get('best_hours') and len(posting_times['best_hours']) > 0:
-                    best_hour = posting_times['best_hours'][0]
-                    record_data['Best_Hour'] = best_hour.get('hour', -1)
-                    record_data['Best_Hour_Score'] = best_hour.get('avg_score', 0)
-                
-                # Best day (just the #1)
-                if posting_times.get('best_days') and len(posting_times['best_days']) > 0:
-                    best_day = posting_times['best_days'][0]
-                    record_data['Best_Day'] = best_day.get('day', '')
-                
-                record_data['Posts_Analyzed_For_Timing'] = posting_times.get('posts_analyzed', 0)
-
-            # Update existing record or create new one using safe wrapper
-            if existing:
-                # Keep existing karma requirements data
-                existing_data = existing[0]['fields']
-                
-                # Preserve karma requirements fields if they exist
-                karma_fields = [
-                    'Post_Karma_Min', 'Comment_Karma_Min', 'Account_Age_Days',
-                    'Confidence', 'Requires_Verification', 'Verification_Method',
-                    'Verification_Optional', 'Verification_Note', 'Posts_Analyzed'
-                ]
-                
-                for field in karma_fields:
-                    if field in existing_data:
-                        record_data[field] = existing_data[field]
-                
-                # Update the record using safe wrapper
-                updated = self.safe_airtable_operation(
-                    self.karma_table.update,
-                    existing[0]['id'],
-                    record_data
-                )
-                if updated:
-                    logging.info(f"Updated Airtable record for {subreddit_name}: {updated['id']}")
-                    return True
-            else:
-                # Create new record using safe wrapper
-                created = self.safe_airtable_operation(
-                    self.karma_table.create,
-                    record_data
-                )
-                if created:
-                    logging.info(f"Created Airtable record for {subreddit_name}: {created['id']}")
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            logging.error(f"Failed to save enhanced data to Airtable for {subreddit_name}: {e}")
-            return False
-
     def test_connection(self):
         """Test Reddit connection on initialization"""
         try:
@@ -826,6 +640,124 @@ class RedditAnalyzer:
                                                avg_comments_per_post, subscribers)
         return result['effectiveness_score']
     
+    def save_analyze_to_airtable(self, analysis_data: Dict[str, Any]) -> bool:
+        """Save enhanced analyze metrics to Airtable"""
+        if not self.airtable:
+            logging.warning("Airtable not initialized, skipping save")
+            return False
+        
+        try:
+            subreddit_name = analysis_data['subreddit']
+            
+            # Check if record exists
+            existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+            current_date = datetime.utcnow().strftime('%Y-%m-%d')
+            
+            # Prepare the record data with enhanced metrics
+            record_data = {
+                'Subreddit': subreddit_name,
+                'Subscribers': analysis_data.get('subscribers', 0),
+                'Effectiveness_Score': analysis_data.get('effectiveness_score', 0),
+                'Avg_Posts_Per_Day': analysis_data.get('avg_posts_per_day', 0),
+                'Avg_Score_Per_Post': analysis_data.get('avg_score_per_post', 0),
+                'Median_Score_Per_Post': analysis_data.get('median_score_per_post', 0),  # NEW
+                'Trimmed_Mean_Score': analysis_data.get('trimmed_mean_score', 0),        # NEW
+                'Avg_Comments_Per_Post': analysis_data.get('avg_comments_per_post', 0),
+                'Days_Analyzed': analysis_data.get('days_analyzed', 7),
+                'Is_NSFW': analysis_data.get('is_nsfw', False),
+                'Posts_Analyzed_For_Scoring': analysis_data.get('posts_analyzed_for_scoring', 0),
+                'Scoring_Version': analysis_data.get('scoring_version', 'v2_realistic'),
+                'Last_Analyzed': current_date,
+                # NEW fields
+                'High_Performers_100_Plus': analysis_data.get('high_performers', {}).get('100+', 0),
+                'High_Performers_200_Plus': analysis_data.get('high_performers', {}).get('200+', 0),
+                'High_Performers_500_Plus': analysis_data.get('high_performers', {}).get('500+', 0),
+                'High_Performer_Percentage': analysis_data.get('high_performer_percentage', 0),
+                'Reach_Description': analysis_data.get('reach_description', ''),
+                'Has_High_Variance': analysis_data.get('has_high_variance', False)
+            }
+            
+            # Add consistency data
+            if analysis_data.get('consistency_analysis'):
+                consistency = analysis_data['consistency_analysis']
+                record_data.update({
+                    'Consistency_Score': consistency.get('consistency_score', 0),
+                    'Good_Posts_Ratio': consistency.get('good_posts_ratio', 0),
+                    'Great_Posts_Ratio': consistency.get('great_posts_ratio', 0),
+                    'Distribution_Pattern': consistency.get('distribution', ''),
+                    'Good_Threshold': consistency.get('good_threshold', 0),
+                    'Great_Threshold': consistency.get('great_threshold', 0)
+                })
+            
+            # Add effectiveness breakdown
+            if analysis_data.get('effectiveness_breakdown'):
+                breakdown = analysis_data['effectiveness_breakdown']
+                record_data.update({
+                    'Engagement_Score': breakdown.get('engagement_score', 0),
+                    'Frequency_Score': breakdown.get('frequency_score', 0),
+                    'Consistency_Component': breakdown.get('consistency_score', 0),
+                    'Size_Modifier': breakdown.get('size_modifier', 1.0)
+                })
+            
+            # Add top post data if available
+            if analysis_data.get('top_post'):
+                top_post = analysis_data['top_post']
+                record_data.update({
+                    'Top_Post_Title': top_post.get('title', '')[:500],
+                    'Top_Post_Score': top_post.get('score', 0),
+                    'Top_Post_Author': top_post.get('author', ''),
+                    'Top_Post_Comments': top_post.get('comments', 0),
+                    'Top_Post_URL': top_post.get('url', ''),
+                    'Top_Post_Flair': top_post.get('flair', '')
+                })
+            
+            # Add posting times data if available
+            if analysis_data.get('posting_times'):
+                posting_times = analysis_data['posting_times']
+                
+                # Best hour (just the #1)
+                if posting_times.get('best_hours') and len(posting_times['best_hours']) > 0:
+                    best_hour = posting_times['best_hours'][0]
+                    record_data['Best_Hour'] = best_hour.get('hour', -1)
+                    record_data['Best_Hour_Score'] = best_hour.get('avg_score', 0)
+                
+                # Best day (just the #1)
+                if posting_times.get('best_days') and len(posting_times['best_days']) > 0:
+                    best_day = posting_times['best_days'][0]
+                    record_data['Best_Day'] = best_day.get('day', '')
+                
+                record_data['Posts_Analyzed_For_Timing'] = posting_times.get('posts_analyzed', 0)
+
+            # Update existing record or create new one
+            if existing:
+                # Keep existing karma requirements data
+                existing_data = existing[0]['fields']
+                
+                # Preserve karma requirements fields if they exist
+                karma_fields = [
+                    'Post_Karma_Min', 'Comment_Karma_Min', 'Account_Age_Days',
+                    'Confidence', 'Requires_Verification', 'Verification_Method',
+                    'Verification_Optional', 'Verification_Note', 'Posts_Analyzed'
+                ]
+                
+                for field in karma_fields:
+                    if field in existing_data:
+                        record_data[field] = existing_data[field]
+                
+                # Update the record
+                updated = self.karma_table.update(existing[0]['id'], record_data)
+                logging.info(f"Updated Airtable record for {subreddit_name}: {updated['id']}")
+            else:
+                # Create new record
+                created = self.karma_table.create(record_data)
+                logging.info(f"Created Airtable record for {subreddit_name}: {created['id']}")
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to save enhanced data to Airtable for {subreddit_name}: {e}")
+            return False
+    
     def analyze_posting_times(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """Analyze best posting times for a subreddit"""
         try:
@@ -1061,10 +993,7 @@ class RedditAnalyzer:
         # Check Airtable cache first
         if self.airtable:
             try:
-                records = self.safe_airtable_operation(
-                    self.karma_table.all,
-                    formula=f"{{Subreddit}}='{subreddit_name}'"
-                )
+                records = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
                 if records:
                     record = records[0]['fields']
                     
@@ -1179,13 +1108,10 @@ class RedditAnalyzer:
                 'posts_scraped': post_limit
             }
             
-            # Save to Airtable with new fields using safe wrapper
+            # Save to Airtable with new fields
             if self.airtable:
                 try:
-                    existing = self.safe_airtable_operation(
-                        self.karma_table.all,
-                        formula=f"{{Subreddit}}='{subreddit_name}'"
-                    )
+                    existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
                     current_date = datetime.utcnow().strftime('%Y-%m-%d')
                     
                     record_data = {
@@ -1203,20 +1129,11 @@ class RedditAnalyzer:
                     }
                     
                     if existing:
-                        updated = self.safe_airtable_operation(
-                            self.karma_table.update,
-                            existing[0]['id'],
-                            record_data
-                        )
-                        if updated:
-                            logging.info(f"Updated Airtable record: {updated['id']}")
+                        updated = self.karma_table.update(existing[0]['id'], record_data)
+                        logging.info(f"Updated Airtable record: {updated['id']}")
                     else:
-                        created = self.safe_airtable_operation(
-                            self.karma_table.create,
-                            record_data
-                        )
-                        if created:
-                            logging.info(f"Created Airtable record: {created['id']}")
+                        created = self.karma_table.create(record_data)
+                        logging.info(f"Created Airtable record: {created['id']}")
                             
                 except Exception as e:
                     logging.error(f"Airtable save failed for {subreddit_name}: {e}")
@@ -2328,31 +2245,24 @@ def health_check():
 def health_check_detailed():
     """Detailed health check with connection pool status"""
     try:
-        # Test Reddit connection using safe wrapper
+        # Test Reddit connection
         reddit_status = "healthy"
         try:
-            test_sub = analyzer.safe_airtable_operation(
-                analyzer.karma_table.all,
-                max_records=1
+            test_sub = analyzer.enhanced_safe_reddit_call(
+                lambda: analyzer.reddit.subreddit('python').subscribers
             )
             if not test_sub:
                 reddit_status = "degraded"
         except Exception as e:
             reddit_status = f"unhealthy: {str(e)[:50]}"
         
-        # Check Airtable connection using safe wrapper
+        # Check Airtable connection
         airtable_status = "disconnected"
         if analyzer.airtable:
             try:
-                # Simple test query using safe wrapper
-                test_result = analyzer.safe_airtable_operation(
-                    analyzer.karma_table.all,
-                    max_records=1
-                )
-                if test_result is not None:
-                    airtable_status = "healthy"
-                else:
-                    airtable_status = "error: safe operation returned None"
+                # Simple test query
+                analyzer.karma_table.all(max_records=1)
+                airtable_status = "healthy"
             except Exception as e:
                 airtable_status = f"error: {str(e)[:50]}"
         
@@ -2363,7 +2273,6 @@ def health_check_detailed():
             'connection_pool_size': len(analyzer.reddit_pool),
             'request_count': analyzer.request_count,
             'semaphore_permits_available': analyzer.request_semaphore._value,
-            'airtable_semaphore_available': analyzer.airtable_semaphore._value if analyzer.airtable else 'N/A',
             'timestamp': datetime.utcnow().isoformat(),
             'uptime_hours': round((time.time() - analyzer.last_reset) / 3600, 2)
         })
