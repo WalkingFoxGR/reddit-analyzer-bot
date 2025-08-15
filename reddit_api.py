@@ -36,6 +36,7 @@ class RedditAnalyzer:
             try:
                 self.airtable = Api(api_key)
                 self.karma_table = self.airtable.table(base_id, 'Karma Requirements')
+                self.mods_table = self.airtable.table(base_id, 'Moderators')  # Add this line
                 logging.info("Airtable initialized successfully")
             except Exception as e:
                 logging.error(f"Failed to initialize Airtable: {e}")
@@ -1891,6 +1892,65 @@ def moderators_endpoint():
     # Save to Airtable if successful
     if result.get('success'):
         analyzer.save_mod_network_to_airtable(result)
+    
+    return jsonify(result)
+
+@app.route('/mods', methods=['POST'])
+def mods_endpoint():
+    """Analyze moderator networks"""
+    data = request.json
+    subreddit = data.get('subreddit')
+    
+    if not subreddit:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    validation = validate_subreddit(subreddit)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    result = analyzer.analyze_moderators(subreddit)
+    
+    # Save to separate Moderators table if successful
+    if result.get('success') and analyzer.airtable:
+        try:
+            # Get the Moderators table
+            base_id = os.getenv('AIRTABLE_BASE_ID')
+            mods_table = analyzer.airtable.table(base_id, 'Moderators')
+            
+            normalized_name = analyzer.normalize_subreddit_name(result['subreddit'])
+            
+            # Prepare moderator data
+            mod_record = {
+                'Subreddit': normalized_name,
+                'Display_Name': result['subreddit'],
+                'Total_Moderators': result.get('total_moderators', 0),
+                'Moderator_List': ', '.join(result.get('moderator_list', [])),
+                'Network_Risk': result.get('warning_level', 'Unknown'),
+                'Connected_Subs_Count': len(result.get('connected_subreddits', [])),
+                'Power_Mods': ', '.join([m for m, d in result.get('mod_networks', {}).items() 
+                                       if d.get('is_power_mod')]),
+                'Top_Connected_Subs': ', '.join([n['subreddit'] for n in 
+                                          result.get('connected_subreddits', [])[:5]]),
+                'Analyzed_Date': datetime.utcnow().strftime('%Y-%m-%d'),
+                'Full_Network_Data': json.dumps(result.get('mod_networks', {}))[:10000]  # Limit size
+            }
+            
+            # Check if record exists
+            existing = mods_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
+            
+            if existing:
+                mods_table.update(existing[0]['id'], mod_record)
+                logging.info(f"Updated moderator record for {result['subreddit']}")
+            else:
+                mods_table.create(mod_record)
+                logging.info(f"Created moderator record for {result['subreddit']}")
+                
+        except Exception as e:
+            logging.error(f"Failed to save moderator data to Airtable: {e}")
     
     return jsonify(result)
 
