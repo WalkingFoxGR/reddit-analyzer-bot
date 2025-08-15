@@ -292,7 +292,7 @@ class RedditAnalyzer:
                 'consistency_score': 0,
                 'good_posts_ratio': 0,
                 'great_posts_ratio': 0,
-                'distribution': 'insufficient_data',
+                'distribution': 'poor',
                 'good_threshold': 0,
                 'great_threshold': 0,
                 'total_posts_analyzed': len(post_scores) if post_scores else 0
