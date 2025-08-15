@@ -16,6 +16,7 @@ from pyairtable import Api
 import statistics
 from contextlib import contextmanager
 from threading import Semaphore
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -56,6 +57,9 @@ class RedditAnalyzer:
         # Add request semaphore to limit concurrent requests
         self.request_semaphore = Semaphore(5)  # Max 5 concurrent Reddit requests
         
+        # Add thread pool for concurrent operations
+        self.executor = ThreadPoolExecutor(max_workers=8)  # 8 concurrent operations
+        
         # Initialize main Reddit instance
         self.reddit = self._create_reddit_instance()
         
@@ -80,6 +84,13 @@ class RedditAnalyzer:
         
         # Test connection on initialization
         self.test_connection()
+    
+    def normalize_subreddit_name(self, name: str) -> str:
+        """Normalize subreddit name for consistent storage"""
+        # Remove r/ prefix and convert to lowercase for storage
+        cleaned = name.replace('r/', '').replace('/r/', '')
+        # Store with consistent casing (lowercase)
+        return cleaned.lower()
     
     def _create_reddit_instance(self):
         """Create a fresh Reddit instance"""
@@ -647,15 +658,18 @@ class RedditAnalyzer:
             return False
         
         try:
-            subreddit_name = analysis_data['subreddit']
+            # Normalize the subreddit name
+            original_name = analysis_data['subreddit']
+            normalized_name = self.normalize_subreddit_name(original_name)
             
-            # Check if record exists
-            existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+            # Check if record exists using normalized name
+            existing = self.karma_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
             current_date = datetime.utcnow().strftime('%Y-%m-%d')
             
             # Prepare the record data with enhanced metrics
             record_data = {
-                'Subreddit': subreddit_name,
+                'Subreddit': normalized_name,  # Store normalized
+                'Display_Name': original_name,  # Keep original for display
                 'Subscribers': analysis_data.get('subscribers', 0),
                 'Effectiveness_Score': analysis_data.get('effectiveness_score', 0),
                 'Avg_Posts_Per_Day': analysis_data.get('avg_posts_per_day', 0),
@@ -746,16 +760,16 @@ class RedditAnalyzer:
                 
                 # Update the record
                 updated = self.karma_table.update(existing[0]['id'], record_data)
-                logging.info(f"Updated Airtable record for {subreddit_name}: {updated['id']}")
+                logging.info(f"Updated Airtable record for {original_name}: {updated['id']}")
             else:
                 # Create new record
                 created = self.karma_table.create(record_data)
-                logging.info(f"Created Airtable record for {subreddit_name}: {created['id']}")
+                logging.info(f"Created Airtable record for {original_name}: {created['id']}")
             
             return True
             
         except Exception as e:
-            logging.error(f"Failed to save enhanced data to Airtable for {subreddit_name}: {e}")
+            logging.error(f"Failed to save enhanced data to Airtable for {original_name}: {e}")
             return False
     
     def analyze_posting_times(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
@@ -993,7 +1007,8 @@ class RedditAnalyzer:
         # Check Airtable cache first
         if self.airtable:
             try:
-                records = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+                normalized_name = self.normalize_subreddit_name(subreddit_name)
+                records = self.karma_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
                 if records:
                     record = records[0]['fields']
                     
@@ -1111,11 +1126,13 @@ class RedditAnalyzer:
             # Save to Airtable with new fields
             if self.airtable:
                 try:
-                    existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+                    normalized_name = self.normalize_subreddit_name(subreddit_name)
+                    existing = self.karma_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
                     current_date = datetime.utcnow().strftime('%Y-%m-%d')
                     
                     record_data = {
-                        'Subreddit': subreddit_name,
+                        'Subreddit': normalized_name,  # Store normalized
+                        'Display_Name': subreddit_name,  # Keep original for display
                         'Post_Karma_Min': result['post_karma_min'],
                         'Comment_Karma_Min': result['comment_karma_min'],
                         'Account_Age_Days': result['account_age_days'],
@@ -1233,6 +1250,136 @@ class RedditAnalyzer:
         except Exception as e:
             logging.error(f"Error in posting requirements analysis: {e}")
             return {'success': False, 'error': str(e)}
+    
+    def analyze_moderators(self, subreddit_name: str) -> Dict[str, Any]:
+        """Analyze moderators and find their other subreddits"""
+        try:
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            # Get all moderators
+            moderators = []
+            mod_networks = {}
+            
+            for mod in subreddit.moderator():
+                mod_name = mod.name
+                moderators.append(mod_name)
+                
+                # Skip AutoModerator and deleted accounts
+                if mod_name in ['AutoModerator', '[deleted]']:
+                    continue
+                
+                # Get other subreddits this mod moderates
+                try:
+                    user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(mod_name))
+                    
+                    # Get their moderated subreddits
+                    other_subs = []
+                    for sub in user.moderated():
+                        if sub.display_name.lower() != subreddit_name.lower():
+                            other_subs.append({
+                                'name': sub.display_name,
+                                'subscribers': sub.subscribers,
+                                'nsfw': sub.over18
+                            })
+                    
+                    # Sort by subscriber count
+                    other_subs.sort(key=lambda x: x['subscribers'], reverse=True)
+                    
+                    mod_networks[mod_name] = {
+                        'total_subs_moderated': len(other_subs) + 1,
+                        'other_subreddits': other_subs[:10],  # Top 10
+                        'is_power_mod': len(other_subs) > 10  # Mods 10+ subs
+                    }
+                    
+                    # Rate limiting
+                    time.sleep(0.5)
+                    
+                except Exception as e:
+                    logging.warning(f"Could not analyze moderator {mod_name}: {e}")
+                    continue
+            
+            # Find overlapping mod teams
+            overlapping_subs = defaultdict(list)
+            for mod, data in mod_networks.items():
+                for sub in data['other_subreddits']:
+                    overlapping_subs[sub['name']].append(mod)
+            
+            # Identify subreddit networks (2+ shared mods)
+            networks = []
+            for sub_name, mods in overlapping_subs.items():
+                if len(mods) >= 2:
+                    networks.append({
+                        'subreddit': sub_name,
+                        'shared_mods': mods,
+                        'connection_strength': len(mods)
+                    })
+            
+            # Sort by connection strength
+            networks.sort(key=lambda x: x['connection_strength'], reverse=True)
+            
+            return {
+                'success': True,
+                'subreddit': subreddit_name,
+                'total_moderators': len(moderators),
+                'moderator_list': moderators,
+                'mod_networks': mod_networks,
+                'connected_subreddits': networks[:20],  # Top 20 connected
+                'warning_level': self._calculate_mod_warning_level(networks)
+            }
+            
+        except Exception as e:
+            logging.error(f"Error analyzing moderators: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def _calculate_mod_warning_level(self, networks: List[Dict]) -> str:
+        """Calculate risk level based on mod networks"""
+        if not networks:
+            return 'Low'
+        
+        strong_connections = sum(1 for n in networks if n['connection_strength'] >= 3)
+        total_connections = len(networks)
+        
+        if strong_connections >= 5:
+            return 'High'  # Part of large mod network
+        elif strong_connections >= 2 or total_connections >= 10:
+            return 'Medium'  # Some network presence
+        else:
+            return 'Low'  # Independent or small network
+
+    def save_mod_network_to_airtable(self, mod_data: Dict[str, Any]) -> bool:
+        """Save moderator network data to Airtable"""
+        if not self.airtable:
+            return False
+        
+        try:
+            normalized_name = self.normalize_subreddit_name(mod_data['subreddit'])
+            record_data = {
+                'Subreddit': normalized_name,
+                'Display_Name': mod_data['subreddit'],
+                'Total_Moderators': mod_data['total_moderators'],
+                'Network_Risk': mod_data['warning_level'],
+                'Connected_Subs_Count': len(mod_data['connected_subreddits']),
+                'Power_Mods': ','.join([m for m, d in mod_data['mod_networks'].items() 
+                                       if d['is_power_mod']]),
+                'Top_Connected': ','.join([n['subreddit'] for n in 
+                                          mod_data['connected_subreddits'][:5]]),
+                'Analyzed_Date': datetime.utcnow().strftime('%Y-%m-%d')
+            }
+            
+            # Update or create record
+            existing = self.karma_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
+            if existing:
+                # Merge with existing data
+                existing_data = existing[0]['fields']
+                record_data.update(existing_data)
+                self.karma_table.update(existing[0]['id'], record_data)
+            else:
+                self.karma_table.create(record_data)
+                
+            return True
+        except Exception as e:
+            logging.error(f"Failed to save mod data: {e}")
+            return False
     
     def find_related_subreddits_progressive(self, seed_subreddit: str, max_users: int = 100,
                                           progress_callback=None) -> Dict[str, Any]:
@@ -1674,7 +1821,7 @@ def analyze_endpoint():
 
 @app.route('/requirements', methods=['POST'])
 def requirements_endpoint():
-    """Separate endpoint for posting requirements analysis"""
+    """Parallel requirements endpoint"""
     data = request.json
     subreddit = data.get('subreddit')
     post_limit = data.get('post_limit', 150)  # Configurable limit
@@ -1697,7 +1844,54 @@ def requirements_endpoint():
             'error_type': validation['error']
         }), 400
     
-    result = analyzer.analyze_posting_requirements(subreddit, post_limit)
+    # Run karma and fake detection in parallel
+    with analyzer.executor as executor:
+        karma_future = executor.submit(analyzer.analyze_karma_requirements, subreddit, post_limit)
+        fake_future = executor.submit(analyzer.detect_fake_upvotes, subreddit)
+        
+        # Wait for both to complete
+        karma_req = karma_future.result()
+        fake_upvotes = fake_future.result()
+    
+    # Get basic subreddit info
+    try:
+        subreddit_obj = analyzer.enhanced_safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit))
+        subscribers = subreddit_obj.subscribers
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Error accessing subreddit: {str(e)}'}), 500
+    
+    return jsonify({
+        'success': True,
+        'subreddit': subreddit,
+        'subscribers': subscribers,
+        'karma_requirements': karma_req,
+        'fake_upvote_detection': fake_upvotes,
+        'analyzed_at': datetime.utcnow().isoformat()
+    })
+
+@app.route('/moderators', methods=['POST'])
+def moderators_endpoint():
+    """Analyze moderator networks"""
+    data = request.json
+    subreddit = data.get('subreddit')
+    
+    if not subreddit:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    validation = validate_subreddit(subreddit)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    result = analyzer.analyze_moderators(subreddit)
+    
+    # Save to Airtable if successful
+    if result.get('success'):
+        analyzer.save_mod_network_to_airtable(result)
+    
     return jsonify(result)
 
 @app.route('/analyze-user', methods=['POST'])
@@ -2210,7 +2404,8 @@ def cache_status():
         'reddit_user_agent': REDDIT_USER_AGENT,
         'timestamp': datetime.utcnow().isoformat(),
         'scoring_version': 'v2_realistic',
-        'semaphore_permits': analyzer.request_semaphore._value
+        'semaphore_permits': analyzer.request_semaphore._value,
+        'thread_pool_active': analyzer.executor._threads.__len__() if hasattr(analyzer.executor, '_threads') else 0
     })
 
 # Connection pool status endpoint
@@ -2273,6 +2468,7 @@ def health_check_detailed():
             'connection_pool_size': len(analyzer.reddit_pool),
             'request_count': analyzer.request_count,
             'semaphore_permits_available': analyzer.request_semaphore._value,
+            'thread_pool_workers': analyzer.executor._max_workers,
             'timestamp': datetime.utcnow().isoformat(),
             'uptime_hours': round((time.time() - analyzer.last_reset) / 3600, 2)
         })
