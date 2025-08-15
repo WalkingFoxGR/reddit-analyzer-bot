@@ -16,7 +16,6 @@ from pyairtable import Api
 import statistics
 from contextlib import contextmanager
 from threading import Semaphore
-from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -36,7 +35,6 @@ class RedditAnalyzer:
             try:
                 self.airtable = Api(api_key)
                 self.karma_table = self.airtable.table(base_id, 'Karma Requirements')
-                self.mods_table = self.airtable.table(base_id, 'Moderators')  # Add this line
                 logging.info("Airtable initialized successfully")
             except Exception as e:
                 logging.error(f"Failed to initialize Airtable: {e}")
@@ -57,9 +55,6 @@ class RedditAnalyzer:
         
         # Add request semaphore to limit concurrent requests
         self.request_semaphore = Semaphore(5)  # Max 5 concurrent Reddit requests
-        
-        # Add thread pool for concurrent operations
-        self.executor = ThreadPoolExecutor(max_workers=8)  # 8 concurrent operations
         
         # Initialize main Reddit instance
         self.reddit = self._create_reddit_instance()
@@ -86,13 +81,6 @@ class RedditAnalyzer:
         # Test connection on initialization
         self.test_connection()
     
-    def normalize_subreddit_name(self, name: str) -> str:
-        """Normalize subreddit name for consistent storage"""
-        # Remove r/ prefix and convert to lowercase for storage
-        cleaned = name.replace('r/', '').replace('/r/', '')
-        # Store with consistent casing (lowercase)
-        return cleaned.lower()
-    
     def _create_reddit_instance(self):
         """Create a fresh Reddit instance"""
         return praw.Reddit(
@@ -104,12 +92,6 @@ class RedditAnalyzer:
             connection_pool_size=5,  # Reduced from 10
             max_retries=2  # Reduced from 3
         )
-
-    def ensure_executor_available(self):
-        """Ensure the thread pool executor is available for use"""
-        if not hasattr(self, 'executor') or self.executor._shutdown:
-            self.executor = ThreadPoolExecutor(max_workers=8)
-            logging.info("ThreadPoolExecutor recreated")
     
     def test_connection(self):
         """Test Reddit connection on initialization"""
@@ -298,7 +280,7 @@ class RedditAnalyzer:
                 'consistency_score': 0,
                 'good_posts_ratio': 0,
                 'great_posts_ratio': 0,
-                'distribution': 'poor',  # FIXED: Changed from 'insufficient_data'
+                'distribution': 'insufficient_data',
                 'good_threshold': 0,
                 'great_threshold': 0,
                 'total_posts_analyzed': len(post_scores) if post_scores else 0
@@ -659,24 +641,21 @@ class RedditAnalyzer:
         return result['effectiveness_score']
     
     def save_analyze_to_airtable(self, analysis_data: Dict[str, Any]) -> bool:
-        """Save enhanced analyze metrics to Airtable with error handling"""
+        """Save enhanced analyze metrics to Airtable"""
         if not self.airtable:
             logging.warning("Airtable not initialized, skipping save")
             return False
         
         try:
-            # Normalize the subreddit name
-            original_name = analysis_data['subreddit']
-            normalized_name = self.normalize_subreddit_name(original_name)
+            subreddit_name = analysis_data['subreddit']
             
-            # Check if record exists using normalized name
-            existing = self.karma_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
+            # Check if record exists
+            existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
             current_date = datetime.utcnow().strftime('%Y-%m-%d')
             
             # Prepare the record data with enhanced metrics
             record_data = {
-                'Subreddit': normalized_name,  # Store normalized
-                'Display_Name': original_name,  # Keep original for display
+                'Subreddit': subreddit_name,
                 'Subscribers': analysis_data.get('subscribers', 0),
                 'Effectiveness_Score': analysis_data.get('effectiveness_score', 0),
                 'Avg_Posts_Per_Day': analysis_data.get('avg_posts_per_day', 0),
@@ -694,32 +673,18 @@ class RedditAnalyzer:
                 'High_Performers_200_Plus': analysis_data.get('high_performers', {}).get('200+', 0),
                 'High_Performers_500_Plus': analysis_data.get('high_performers', {}).get('500+', 0),
                 'High_Performer_Percentage': analysis_data.get('high_performer_percentage', 0),
+                'Reach_Description': analysis_data.get('reach_description', ''),
                 'Has_High_Variance': analysis_data.get('has_high_variance', False)
             }
             
-            # Handle reach description safely
-            reach_desc = analysis_data.get('reach_description', '')
-            if reach_desc:
-                record_data['Reach_Description'] = reach_desc
-            
-            # Add consistency data with safe fallbacks
+            # Add consistency data
             if analysis_data.get('consistency_analysis'):
                 consistency = analysis_data['consistency_analysis']
-                
-                # Safe distribution mapping
-                distribution = consistency.get('distribution', '')
-                distribution_mapping = {
-                    'insufficient_data': 'poor',
-                    'unknown': 'poor',
-                    '': 'poor'
-                }
-                safe_distribution = distribution_mapping.get(distribution, distribution)
-                
                 record_data.update({
                     'Consistency_Score': consistency.get('consistency_score', 0),
                     'Good_Posts_Ratio': consistency.get('good_posts_ratio', 0),
                     'Great_Posts_Ratio': consistency.get('great_posts_ratio', 0),
-                    'Distribution_Pattern': safe_distribution,
+                    'Distribution_Pattern': consistency.get('distribution', ''),
                     'Good_Threshold': consistency.get('good_threshold', 0),
                     'Great_Threshold': consistency.get('great_threshold', 0)
                 })
@@ -779,54 +744,18 @@ class RedditAnalyzer:
                     if field in existing_data:
                         record_data[field] = existing_data[field]
                 
-                # Update with error handling
-                try:
-                    updated = self.karma_table.update(existing[0]['id'], record_data)
-                    logging.info(f"Updated Airtable record for {original_name}: {updated['id']}")
-                except Exception as airtable_error:
-                    error_str = str(airtable_error)
-                    if 'INVALID_MULTIPLE_CHOICE_OPTIONS' in error_str:
-                        # Remove problematic select fields and retry
-                        problematic_fields = ['Distribution_Pattern', 'Reach_Description']
-                        for field in problematic_fields:
-                            if field in record_data:
-                                del record_data[field]
-                        
-                        try:
-                            updated = self.karma_table.update(existing[0]['id'], record_data)
-                            logging.warning(f"Updated Airtable record for {original_name} without select fields: {updated['id']}")
-                        except Exception as retry_error:
-                            logging.error(f"Failed to update Airtable record even after removing select fields: {retry_error}")
-                            return False
-                    else:
-                        raise  # Re-raise if it's a different error
+                # Update the record
+                updated = self.karma_table.update(existing[0]['id'], record_data)
+                logging.info(f"Updated Airtable record for {subreddit_name}: {updated['id']}")
             else:
-                # Create new record with error handling
-                try:
-                    created = self.karma_table.create(record_data)
-                    logging.info(f"Created Airtable record for {original_name}: {created['id']}")
-                except Exception as airtable_error:
-                    error_str = str(airtable_error)
-                    if 'INVALID_MULTIPLE_CHOICE_OPTIONS' in error_str:
-                        # Remove problematic select fields and retry
-                        problematic_fields = ['Distribution_Pattern', 'Reach_Description']
-                        for field in problematic_fields:
-                            if field in record_data:
-                                del record_data[field]
-                        
-                        try:
-                            created = self.karma_table.create(record_data)
-                            logging.warning(f"Created Airtable record for {original_name} without select fields: {created['id']}")
-                        except Exception as retry_error:
-                            logging.error(f"Failed to create Airtable record even after removing select fields: {retry_error}")
-                            return False
-                    else:
-                        raise  # Re-raise if it's a different error
+                # Create new record
+                created = self.karma_table.create(record_data)
+                logging.info(f"Created Airtable record for {subreddit_name}: {created['id']}")
             
             return True
             
         except Exception as e:
-            logging.error(f"Failed to save enhanced data to Airtable for {original_name}: {e}")
+            logging.error(f"Failed to save enhanced data to Airtable for {subreddit_name}: {e}")
             return False
     
     def analyze_posting_times(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
@@ -1064,8 +993,7 @@ class RedditAnalyzer:
         # Check Airtable cache first
         if self.airtable:
             try:
-                normalized_name = self.normalize_subreddit_name(subreddit_name)
-                records = self.karma_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
+                records = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
                 if records:
                     record = records[0]['fields']
                     
@@ -1183,13 +1111,11 @@ class RedditAnalyzer:
             # Save to Airtable with new fields
             if self.airtable:
                 try:
-                    normalized_name = self.normalize_subreddit_name(subreddit_name)
-                    existing = self.karma_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
+                    existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
                     current_date = datetime.utcnow().strftime('%Y-%m-%d')
                     
                     record_data = {
-                        'Subreddit': normalized_name,  # Store normalized
-                        'Display_Name': subreddit_name,  # Keep original for display
+                        'Subreddit': subreddit_name,
                         'Post_Karma_Min': result['post_karma_min'],
                         'Comment_Karma_Min': result['comment_karma_min'],
                         'Account_Age_Days': result['account_age_days'],
@@ -1307,136 +1233,6 @@ class RedditAnalyzer:
         except Exception as e:
             logging.error(f"Error in posting requirements analysis: {e}")
             return {'success': False, 'error': str(e)}
-    
-    def analyze_moderators(self, subreddit_name: str) -> Dict[str, Any]:
-        """Analyze moderators and find their other subreddits"""
-        try:
-            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
-            
-            # Get all moderators
-            moderators = []
-            mod_networks = {}
-            
-            for mod in subreddit.moderator():
-                mod_name = mod.name
-                moderators.append(mod_name)
-                
-                # Skip AutoModerator and deleted accounts
-                if mod_name in ['AutoModerator', '[deleted]']:
-                    continue
-                
-                # Get other subreddits this mod moderates
-                try:
-                    user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(mod_name))
-                    
-                    # Get their moderated subreddits
-                    other_subs = []
-                    for sub in user.moderated():
-                        if sub.display_name.lower() != subreddit_name.lower():
-                            other_subs.append({
-                                'name': sub.display_name,
-                                'subscribers': sub.subscribers,
-                                'nsfw': sub.over18
-                            })
-                    
-                    # Sort by subscriber count
-                    other_subs.sort(key=lambda x: x['subscribers'], reverse=True)
-                    
-                    mod_networks[mod_name] = {
-                        'total_subs_moderated': len(other_subs) + 1,
-                        'other_subreddits': other_subs[:10],  # Top 10
-                        'is_power_mod': len(other_subs) > 10  # Mods 10+ subs
-                    }
-                    
-                    # Rate limiting
-                    time.sleep(0.5)
-                    
-                except Exception as e:
-                    logging.warning(f"Could not analyze moderator {mod_name}: {e}")
-                    continue
-            
-            # Find overlapping mod teams
-            overlapping_subs = defaultdict(list)
-            for mod, data in mod_networks.items():
-                for sub in data['other_subreddits']:
-                    overlapping_subs[sub['name']].append(mod)
-            
-            # Identify subreddit networks (2+ shared mods)
-            networks = []
-            for sub_name, mods in overlapping_subs.items():
-                if len(mods) >= 2:
-                    networks.append({
-                        'subreddit': sub_name,
-                        'shared_mods': mods,
-                        'connection_strength': len(mods)
-                    })
-            
-            # Sort by connection strength
-            networks.sort(key=lambda x: x['connection_strength'], reverse=True)
-            
-            return {
-                'success': True,
-                'subreddit': subreddit_name,
-                'total_moderators': len(moderators),
-                'moderator_list': moderators,
-                'mod_networks': mod_networks,
-                'connected_subreddits': networks[:20],  # Top 20 connected
-                'warning_level': self._calculate_mod_warning_level(networks)
-            }
-            
-        except Exception as e:
-            logging.error(f"Error analyzing moderators: {e}")
-            return {'success': False, 'error': str(e)}
-
-    def _calculate_mod_warning_level(self, networks: List[Dict]) -> str:
-        """Calculate risk level based on mod networks"""
-        if not networks:
-            return 'Low'
-        
-        strong_connections = sum(1 for n in networks if n['connection_strength'] >= 3)
-        total_connections = len(networks)
-        
-        if strong_connections >= 5:
-            return 'High'  # Part of large mod network
-        elif strong_connections >= 2 or total_connections >= 10:
-            return 'Medium'  # Some network presence
-        else:
-            return 'Low'  # Independent or small network
-
-    def save_mod_network_to_airtable(self, mod_data: Dict[str, Any]) -> bool:
-        """Save moderator network data to Airtable"""
-        if not self.airtable:
-            return False
-        
-        try:
-            normalized_name = self.normalize_subreddit_name(mod_data['subreddit'])
-            record_data = {
-                'Subreddit': normalized_name,
-                'Display_Name': mod_data['subreddit'],
-                'Total_Moderators': mod_data['total_moderators'],
-                'Network_Risk': mod_data['warning_level'],
-                'Connected_Subs_Count': len(mod_data['connected_subreddits']),
-                'Power_Mods': ','.join([m for m, d in mod_data['mod_networks'].items() 
-                                       if d['is_power_mod']]),
-                'Top_Connected': ','.join([n['subreddit'] for n in 
-                                          mod_data['connected_subreddits'][:5]]),
-                'Analyzed_Date': datetime.utcnow().strftime('%Y-%m-%d')
-            }
-            
-            # Update or create record
-            existing = self.karma_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
-            if existing:
-                # Merge with existing data
-                existing_data = existing[0]['fields']
-                record_data.update(existing_data)
-                self.karma_table.update(existing[0]['id'], record_data)
-            else:
-                self.karma_table.create(record_data)
-                
-            return True
-        except Exception as e:
-            logging.error(f"Failed to save mod data: {e}")
-            return False
     
     def find_related_subreddits_progressive(self, seed_subreddit: str, max_users: int = 100,
                                           progress_callback=None) -> Dict[str, Any]:
@@ -1878,15 +1674,15 @@ def analyze_endpoint():
 
 @app.route('/requirements', methods=['POST'])
 def requirements_endpoint():
-    """Parallel requirements endpoint"""
+    """Separate endpoint for posting requirements analysis"""
     data = request.json
     subreddit = data.get('subreddit')
-    post_limit = data.get('post_limit', 150)
+    post_limit = data.get('post_limit', 150)  # Configurable limit
     
     # Validate post_limit
     if post_limit < 10:
         post_limit = 10
-    elif post_limit > 500:
+    elif post_limit > 500:  # Max limit to prevent abuse
         post_limit = 500
     
     if not subreddit:
@@ -1901,115 +1697,7 @@ def requirements_endpoint():
             'error_type': validation['error']
         }), 400
     
-    # Ensure executor is available
-    analyzer.ensure_executor_available()
-    
-    # Run karma and fake detection in parallel - FIXED VERSION
-    karma_future = analyzer.executor.submit(analyzer.analyze_karma_requirements, subreddit, post_limit)
-    fake_future = analyzer.executor.submit(analyzer.detect_fake_upvotes, subreddit)
-    
-    # Wait for both to complete
-    karma_req = karma_future.result()
-    fake_upvotes = fake_future.result()
-    
-    # Get basic subreddit info
-    try:
-        subreddit_obj = analyzer.enhanced_safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit))
-        subscribers = subreddit_obj.subscribers
-    except Exception as e:
-        return jsonify({'success': False, 'error': f'Error accessing subreddit: {str(e)}'}), 500
-    
-    return jsonify({
-        'success': True,
-        'subreddit': subreddit,
-        'subscribers': subscribers,
-        'karma_requirements': karma_req,
-        'fake_upvote_detection': fake_upvotes,
-        'analyzed_at': datetime.utcnow().isoformat()
-    })
-
-@app.route('/moderators', methods=['POST'])
-def moderators_endpoint():
-    """Analyze moderator networks"""
-    data = request.json
-    subreddit = data.get('subreddit')
-    
-    if not subreddit:
-        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
-    
-    validation = validate_subreddit(subreddit)
-    if not validation['valid']:
-        return jsonify({
-            'success': False,
-            'error': validation['message'],
-            'error_type': validation['error']
-        }), 400
-    
-    result = analyzer.analyze_moderators(subreddit)
-    
-    # Save to Airtable if successful
-    if result.get('success'):
-        analyzer.save_mod_network_to_airtable(result)
-    
-    return jsonify(result)
-
-@app.route('/mods', methods=['POST'])
-def mods_endpoint():
-    """Analyze moderator networks"""
-    data = request.json
-    subreddit = data.get('subreddit')
-    
-    if not subreddit:
-        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
-    
-    validation = validate_subreddit(subreddit)
-    if not validation['valid']:
-        return jsonify({
-            'success': False,
-            'error': validation['message'],
-            'error_type': validation['error']
-        }), 400
-    
-    result = analyzer.analyze_moderators(subreddit)
-    
-    # Save to separate Moderators table if successful
-    if result.get('success') and analyzer.airtable:
-        try:
-            # Get the Moderators table
-            base_id = os.getenv('AIRTABLE_BASE_ID')
-            mods_table = analyzer.airtable.table(base_id, 'Moderators')
-            
-            normalized_name = analyzer.normalize_subreddit_name(result['subreddit'])
-            
-            # Prepare moderator data
-            mod_record = {
-                'Subreddit': normalized_name,
-                'Display_Name': result['subreddit'],
-                'Total_Moderators': result.get('total_moderators', 0),
-                'Moderator_List': ', '.join(result.get('moderator_list', [])),
-                'Network_Risk': result.get('warning_level', 'Unknown'),
-                'Connected_Subs_Count': len(result.get('connected_subreddits', [])),
-                'Power_Mods': ', '.join([m for m, d in result.get('mod_networks', {}).items() 
-                                       if d.get('is_power_mod')]),
-                'Top_Connected_Subs': ', '.join([n['subreddit'] for n in 
-                                          result.get('connected_subreddits', [])[:5]]),
-                'Analyzed_Date': datetime.utcnow().strftime('%Y-%m-%d'),
-                'Full_Network_Data': json.dumps(result.get('mod_networks', {}))[:10000]  # Limit size
-            }
-            
-            # Check if record exists
-            existing = mods_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
-            
-            if existing:
-                mods_table.update(existing[0]['id'], mod_record)
-                logging.info(f"Updated moderator record for {result['subreddit']}")
-            else:
-                mods_table.create(mod_record)
-                logging.info(f"Created moderator record for {result['subreddit']}")
-                
-        except Exception as e:
-            logging.error(f"Failed to save moderator data to Airtable: {e}")
-    
+    result = analyzer.analyze_posting_requirements(subreddit, post_limit)
     return jsonify(result)
 
 @app.route('/analyze-user', methods=['POST'])
@@ -2522,8 +2210,7 @@ def cache_status():
         'reddit_user_agent': REDDIT_USER_AGENT,
         'timestamp': datetime.utcnow().isoformat(),
         'scoring_version': 'v2_realistic',
-        'semaphore_permits': analyzer.request_semaphore._value,
-        'thread_pool_active': analyzer.executor._threads.__len__() if hasattr(analyzer.executor, '_threads') else 0
+        'semaphore_permits': analyzer.request_semaphore._value
     })
 
 # Connection pool status endpoint
@@ -2586,7 +2273,6 @@ def health_check_detailed():
             'connection_pool_size': len(analyzer.reddit_pool),
             'request_count': analyzer.request_count,
             'semaphore_permits_available': analyzer.request_semaphore._value,
-            'thread_pool_workers': analyzer.executor._max_workers,
             'timestamp': datetime.utcnow().isoformat(),
             'uptime_hours': round((time.time() - analyzer.last_reset) / 3600, 2)
         })
