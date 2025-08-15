@@ -104,6 +104,12 @@ class RedditAnalyzer:
             connection_pool_size=5,  # Reduced from 10
             max_retries=2  # Reduced from 3
         )
+
+    def ensure_executor_available(self):
+        """Ensure the thread pool executor is available for use"""
+        if not hasattr(self, 'executor') or self.executor._shutdown:
+            self.executor = ThreadPoolExecutor(max_workers=8)
+            logging.info("ThreadPoolExecutor recreated")
     
     def test_connection(self):
         """Test Reddit connection on initialization"""
@@ -292,7 +298,7 @@ class RedditAnalyzer:
                 'consistency_score': 0,
                 'good_posts_ratio': 0,
                 'great_posts_ratio': 0,
-                'distribution': 'poor',
+                'distribution': 'poor',  # FIXED: Changed from 'insufficient_data'
                 'good_threshold': 0,
                 'great_threshold': 0,
                 'total_posts_analyzed': len(post_scores) if post_scores else 0
@@ -653,7 +659,7 @@ class RedditAnalyzer:
         return result['effectiveness_score']
     
     def save_analyze_to_airtable(self, analysis_data: Dict[str, Any]) -> bool:
-        """Save enhanced analyze metrics to Airtable"""
+        """Save enhanced analyze metrics to Airtable with error handling"""
         if not self.airtable:
             logging.warning("Airtable not initialized, skipping save")
             return False
@@ -688,18 +694,32 @@ class RedditAnalyzer:
                 'High_Performers_200_Plus': analysis_data.get('high_performers', {}).get('200+', 0),
                 'High_Performers_500_Plus': analysis_data.get('high_performers', {}).get('500+', 0),
                 'High_Performer_Percentage': analysis_data.get('high_performer_percentage', 0),
-                'Reach_Description': analysis_data.get('reach_description', ''),
                 'Has_High_Variance': analysis_data.get('has_high_variance', False)
             }
             
-            # Add consistency data
+            # Handle reach description safely
+            reach_desc = analysis_data.get('reach_description', '')
+            if reach_desc:
+                record_data['Reach_Description'] = reach_desc
+            
+            # Add consistency data with safe fallbacks
             if analysis_data.get('consistency_analysis'):
                 consistency = analysis_data['consistency_analysis']
+                
+                # Safe distribution mapping
+                distribution = consistency.get('distribution', '')
+                distribution_mapping = {
+                    'insufficient_data': 'poor',
+                    'unknown': 'poor',
+                    '': 'poor'
+                }
+                safe_distribution = distribution_mapping.get(distribution, distribution)
+                
                 record_data.update({
                     'Consistency_Score': consistency.get('consistency_score', 0),
                     'Good_Posts_Ratio': consistency.get('good_posts_ratio', 0),
                     'Great_Posts_Ratio': consistency.get('great_posts_ratio', 0),
-                    'Distribution_Pattern': consistency.get('distribution', ''),
+                    'Distribution_Pattern': safe_distribution,
                     'Good_Threshold': consistency.get('good_threshold', 0),
                     'Great_Threshold': consistency.get('great_threshold', 0)
                 })
@@ -759,13 +779,49 @@ class RedditAnalyzer:
                     if field in existing_data:
                         record_data[field] = existing_data[field]
                 
-                # Update the record
-                updated = self.karma_table.update(existing[0]['id'], record_data)
-                logging.info(f"Updated Airtable record for {original_name}: {updated['id']}")
+                # Update with error handling
+                try:
+                    updated = self.karma_table.update(existing[0]['id'], record_data)
+                    logging.info(f"Updated Airtable record for {original_name}: {updated['id']}")
+                except Exception as airtable_error:
+                    error_str = str(airtable_error)
+                    if 'INVALID_MULTIPLE_CHOICE_OPTIONS' in error_str:
+                        # Remove problematic select fields and retry
+                        problematic_fields = ['Distribution_Pattern', 'Reach_Description']
+                        for field in problematic_fields:
+                            if field in record_data:
+                                del record_data[field]
+                        
+                        try:
+                            updated = self.karma_table.update(existing[0]['id'], record_data)
+                            logging.warning(f"Updated Airtable record for {original_name} without select fields: {updated['id']}")
+                        except Exception as retry_error:
+                            logging.error(f"Failed to update Airtable record even after removing select fields: {retry_error}")
+                            return False
+                    else:
+                        raise  # Re-raise if it's a different error
             else:
-                # Create new record
-                created = self.karma_table.create(record_data)
-                logging.info(f"Created Airtable record for {original_name}: {created['id']}")
+                # Create new record with error handling
+                try:
+                    created = self.karma_table.create(record_data)
+                    logging.info(f"Created Airtable record for {original_name}: {created['id']}")
+                except Exception as airtable_error:
+                    error_str = str(airtable_error)
+                    if 'INVALID_MULTIPLE_CHOICE_OPTIONS' in error_str:
+                        # Remove problematic select fields and retry
+                        problematic_fields = ['Distribution_Pattern', 'Reach_Description']
+                        for field in problematic_fields:
+                            if field in record_data:
+                                del record_data[field]
+                        
+                        try:
+                            created = self.karma_table.create(record_data)
+                            logging.warning(f"Created Airtable record for {original_name} without select fields: {created['id']}")
+                        except Exception as retry_error:
+                            logging.error(f"Failed to create Airtable record even after removing select fields: {retry_error}")
+                            return False
+                    else:
+                        raise  # Re-raise if it's a different error
             
             return True
             
@@ -1825,12 +1881,12 @@ def requirements_endpoint():
     """Parallel requirements endpoint"""
     data = request.json
     subreddit = data.get('subreddit')
-    post_limit = data.get('post_limit', 150)  # Configurable limit
+    post_limit = data.get('post_limit', 150)
     
     # Validate post_limit
     if post_limit < 10:
         post_limit = 10
-    elif post_limit > 500:  # Max limit to prevent abuse
+    elif post_limit > 500:
         post_limit = 500
     
     if not subreddit:
@@ -1845,14 +1901,16 @@ def requirements_endpoint():
             'error_type': validation['error']
         }), 400
     
-    # Run karma and fake detection in parallel
-    with analyzer.executor as executor:
-        karma_future = executor.submit(analyzer.analyze_karma_requirements, subreddit, post_limit)
-        fake_future = executor.submit(analyzer.detect_fake_upvotes, subreddit)
-        
-        # Wait for both to complete
-        karma_req = karma_future.result()
-        fake_upvotes = fake_future.result()
+    # Ensure executor is available
+    analyzer.ensure_executor_available()
+    
+    # Run karma and fake detection in parallel - FIXED VERSION
+    karma_future = analyzer.executor.submit(analyzer.analyze_karma_requirements, subreddit, post_limit)
+    fake_future = analyzer.executor.submit(analyzer.detect_fake_upvotes, subreddit)
+    
+    # Wait for both to complete
+    karma_req = karma_future.result()
+    fake_upvotes = fake_future.result()
     
     # Get basic subreddit info
     try:
