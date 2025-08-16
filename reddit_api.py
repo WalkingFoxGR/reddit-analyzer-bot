@@ -52,8 +52,9 @@ class RedditAnalyzer:
         self.pool_creation_time = {}  # Track when each connection was created
         self.request_count = 0
         self.last_reset = time.time()
-        self.max_connection_age = 300  # Max 5 minutes per connection
-        self.max_idle_time = 60  # Max 1 minute idle before refresh
+        # Less aggressive connection management
+        self.max_connection_age = 600  # 10 minutes instead of 5
+        self.max_idle_time = 300       # 5 minutes instead of 1
         
         # Add request semaphore to limit concurrent requests
         self.request_semaphore = Semaphore(5)  # Max 5 concurrent Reddit requests
@@ -165,68 +166,62 @@ class RedditAnalyzer:
     
     def enhanced_safe_reddit_call(self, func, max_retries=3, backoff_base=2):
         """Enhanced wrapper with better error handling"""
-        with self.request_semaphore:  # Limit concurrent requests
+        with self.request_semaphore:
             last_exception = None
             
             for attempt in range(max_retries):
                 try:
-                    # Add delay between retries
                     if attempt > 0:
-                        wait_time = min(backoff_base ** attempt, 30)  # Cap at 30 seconds
+                        wait_time = min(backoff_base ** attempt, 30)
                         logging.info(f"Retry attempt {attempt + 1}, waiting {wait_time}s")
                         time.sleep(wait_time)
                     
                     with self.get_reddit_instance() as reddit:
-                        # Execute with fresh connection
                         original_reddit = self.reddit
                         self.reddit = reddit
                         try:
-                            # Add small delay to prevent hammering
                             if attempt == 0:
-                                time.sleep(0.1)  # 100ms delay between requests
+                                time.sleep(0.1)
                             
                             result = func()
                             return result
                         finally:
                             self.reddit = original_reddit
                             
-                except ConnectionResetError as e:
-                    logging.warning(f"Connection reset on attempt {attempt + 1}: {e}")
+                except ResponseException as e:
+                    logging.warning(f"Response exception on attempt {attempt + 1}: {e}")
                     last_exception = e
-                    # Don't retry immediately for connection resets
-                    if attempt < max_retries - 1:
-                        time.sleep(2)
-                    continue
+                    
+                    # DON'T RETRY 404 ERRORS - they mean the resource doesn't exist
+                    if hasattr(e, 'response') and e.response:
+                        if e.response.status_code == 404:
+                            logging.error(f"404 Not Found - not retrying: {e}")
+                            raise  # Don't retry, just raise immediately
+                        elif "Redirect" in str(e):
+                            logging.error(f"Redirect error - resource doesn't exist: {e}")
+                            raise  # Don't retry redirects either
+                    
+                    # Only retry server errors (5xx)
+                    if hasattr(e, 'response') and e.response and e.response.status_code >= 500:
+                        if attempt < max_retries - 1:
+                            time.sleep(backoff_base ** (attempt + 1))
+                            continue
+                            
+                    # For other response exceptions, don't retry
+                    raise
                     
                 except RequestException as e:
                     logging.warning(f"Request exception on attempt {attempt + 1}: {e}")
                     last_exception = e
                     
-                    # Check for rate limiting
                     if hasattr(e, 'response') and e.response:
                         if e.response.status_code == 429:
-                            # Rate limited - wait longer
                             wait_time = 60
                             logging.info(f"Rate limited, waiting {wait_time}s")
                             time.sleep(wait_time)
                         elif e.response.status_code == 404:
-                            # Not found - don't retry
-                            raise
-                    continue
-                    
-                except ResponseException as e:
-                    logging.warning(f"Response exception on attempt {attempt + 1}: {e}")
-                    last_exception = e
-                    
-                    # Check for redirect (subreddit doesn't exist)
-                    if "Redirect" in str(e):
-                        # Don't retry for non-existent subreddits
-                        raise
-                        
-                    # Server error - retry with backoff
-                    if hasattr(e, 'response') and e.response:
-                        if e.response.status_code >= 500:
-                            time.sleep(backoff_base ** (attempt + 1))
+                            logging.error(f"404 Not Found - not retrying: {e}")
+                            raise  # Don't retry 404s
                     continue
                     
                 except Exception as e:
@@ -234,14 +229,11 @@ class RedditAnalyzer:
                     last_exception = e
                     
                     if "Read timed out" in str(e):
-                        # Timeout - retry with longer delay
                         time.sleep(5)
                         continue
                     else:
-                        # Unknown error - don't retry
                         raise
             
-            # All retries exhausted
             if last_exception:
                 raise last_exception
             else:
@@ -2143,11 +2135,34 @@ def analyze_flairs():
     
     try:
         subreddit = analyzer.enhanced_safe_reddit_call(lambda: analyzer.reddit.subreddit(subreddit_name))
-        flair_stats = {}
         
-        # Store sample posts for each flair
+        # Check if we can actually access the subreddit's posts
+        try:
+            # Test if we can get at least one post
+            test_posts = list(subreddit.hot(limit=1))
+            if not test_posts:
+                return jsonify({
+                    'success': False, 
+                    'error': f'r/{subreddit_name} has no accessible posts or flairs'
+                }), 400
+        except Exception as e:
+            if "404" in str(e) or "not found" in str(e).lower():
+                return jsonify({
+                    'success': False,
+                    'error': f'r/{subreddit_name} not found or inaccessible'
+                }), 400
+            elif "private" in str(e).lower() or "forbidden" in str(e).lower():
+                return jsonify({
+                    'success': False,
+                    'error': f'r/{subreddit_name} is private or restricted'
+                }), 400
+            else:
+                raise
+        
+        flair_stats = {}
         flair_samples = defaultdict(list)
         
+        # Rest of your existing flair analysis code...
         for post in subreddit.hot(limit=100):
             flair = post.link_flair_text or 'No Flair'
             if flair not in flair_stats:
@@ -2161,7 +2176,6 @@ def analyze_flairs():
             flair_stats[flair]['total_score'] += post.score
             flair_stats[flair]['total_comments'] += post.num_comments
             
-            # Store sample posts (max 3 per flair)
             if len(flair_samples[flair]) < 3:
                 flair_samples[flair].append({
                     'title': post.title,
@@ -2182,7 +2196,6 @@ def analyze_flairs():
                     'sample_posts': flair_samples[flair]
                 })
         
-        # Sort by average score
         flair_analysis.sort(key=lambda x: x['avg_score'], reverse=True)
         
         return jsonify({
@@ -2193,8 +2206,26 @@ def analyze_flairs():
             'public_description': subreddit.public_description or 'No description',
             'analyzed_posts': sum(stats['count'] for stats in flair_stats.values())
         })
+        
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logging.error(f"Error analyzing flairs for {subreddit_name}: {e}")
+        error_message = str(e)
+        
+        if "404" in error_message or "not found" in error_message.lower():
+            return jsonify({
+                'success': False,
+                'error': f'r/{subreddit_name} not found'
+            }), 400
+        elif "private" in error_message.lower() or "forbidden" in error_message.lower():
+            return jsonify({
+                'success': False,
+                'error': f'r/{subreddit_name} is private or restricted'
+            }), 400
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Analysis failed: {error_message}'
+            }), 500
 
 # Helper method to clean up old cache entries periodically
 def cleanup_cache():
@@ -2309,6 +2340,22 @@ def health_check_detailed():
 @app.route('/ping', methods=['GET'])
 def ping():
     return jsonify({'message': 'pong', 'timestamp': datetime.utcnow().isoformat()})
+
+@app.errorhandler(500)
+def handle_internal_error(e):
+    logging.error(f"Internal server error: {e}")
+    return jsonify({
+        'success': False,
+        'error': 'Internal server error occurred'
+    }), 500
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    logging.error(f"Endpoint not found: {e}")
+    return jsonify({
+        'success': False,
+        'error': 'Endpoint not found'
+    }), 404
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
