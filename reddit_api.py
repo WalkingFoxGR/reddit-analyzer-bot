@@ -37,6 +37,7 @@ class RedditAnalyzer:
             try:
                 self.airtable = Api(api_key)
                 self.karma_table = self.airtable.table(base_id, 'Karma Requirements')
+                self.mods_table = self.airtable.table(base_id, 'Moderators')  # NEW TABLE
                 logging.info("Airtable initialized successfully")
             except Exception as e:
                 logging.error(f"Failed to initialize Airtable: {e}")
@@ -251,10 +252,32 @@ class RedditAnalyzer:
             
             # Check for NSFW keywords in subreddit name/description
             nsfw_keywords = [
-                'nsfw', 'porn', 'sex', 'xxx', 'nude', 'naked', 'boobs', 'ass', 'pussy', 
+                'nsfw', 'porn', 'sex', 'xxx', 'nude', 'naked', 'boobs', 'ass', 'pussy',
                 'cock', 'dick', 'penis', 'vagina', 'tits', 'fetish', 'kink', 'erotic',
-                'gonewild', 'amateur', 'milf', 'teen', 'gay', 'lesbian', 'bdsm',
-                'anal', 'oral', 'cumshot', 'masturbat', 'orgasm', 'handjob', 'blowjob'
+                'gonewild', 'amateur', 'milf', 'teen', 'gay', 'lesbian', 'bdsm', 'anal',
+                'oral', 'cumshot', 'masturbat', 'orgasm', 'handjob', 'blowjob', 'anus',
+                'areola', 'balls', 'breasts', 'butt', 'clitoris', 'labia', 'nipples',
+                'nipple', 'scrotum', 'testicles', 'testicle', 'vag', 'urethra', 'anal sex',
+                'bukkake', 'cunnilingus', 'fellatio', 'gangbang', 'deepthroat', 'dp',
+                'double penetration', '69', 'fingering', 'fisting', 'rimjob', 'rimming',
+                'creampie', 'cream pie', 'facial', 'facefuck', 'face fuck', 'cum', 'jizz',
+                'splooge', 'spunk', 'squirting', 'cumdrip', 'cumslut', 'cumstain',
+                'cumming', 'dildo', 'vibrator', 'buttplug', 'strapon', 'strap-on',
+                'cockring', 'anal beads', 'anus beads', 'escort', 'call girl', 'callgirl',
+                'sex work', 'prostitute', 'hooker', 'pimp', 'gigolo', 'pornhub', 'xvideos',
+                'xhamster', 'youporn', 'redtube', 'xnxx', 'tnaflix', 'brazzers',
+                'bangbros', 'naughtyamerica', 'naughty america', 'evilangel', 'bondage',
+                'spanking', 'sadomasochism', 'sadism', 'latex', 'leather', 'roleplay',
+                'voyeur', 'exhibitionism', 'watersports', 'urophilia', 'scat',
+                'foot fetish', 'footfetish', 'clothed male x female', 'furry', 'yiff',
+                'hentai', 'ecchi', 'yaoi', 'yuri', 'rape', 'incest', 'bestiality',
+                'zoophilia', 'cp', 'child porn', 'childporn', 'pedo', 'pedophile',
+                'underage', 'minor', 'barely legal', 'barelylegal', 'transgender',
+                'transsexual', 'trans', 'tranny', 'shemale', 'trap', 'slut', 'whore',
+                'thot', 'bareback', 'exhibitionist', 'masturbation', 'masturbator',
+                'pornography', 'pornographic', 'softcore', 'hardcore', 'striptease',
+                'pole dance', 'pole dancing', 'onlyfans', 'camgirl', 'camboy', 'webcam',
+                'sex tape', 'sex video'
             ]
             
             sub_name_lower = subreddit_name.lower()
@@ -1567,12 +1590,147 @@ class RedditAnalyzer:
             logging.error(f"Error analyzing user {username}: {e}")
             return {'success': False, 'error': str(e)}
     
+    def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
+        """Get moderators of a subreddit"""
+        try:
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            moderators = []
+            shared_mods = []
+            
+            # Get moderators
+            for moderator in subreddit.moderator():
+                try:
+                    # Check if moderator account still exists/is active
+                    mod_user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(moderator.name))
+                    
+                    # Try to access their profile to check if suspended
+                    try:
+                        _ = mod_user.created_utc  # This will fail if suspended
+                        is_active = True
+                    except:
+                        is_active = False
+                    
+                    mod_data = {
+                        'username': moderator.name,
+                        'is_active': is_active,
+                        'permissions': list(moderator.mod_permissions) if hasattr(moderator, 'mod_permissions') else ['unknown']
+                    }
+                    moderators.append(mod_data)
+                    
+                    time.sleep(0.1)  # Rate limiting
+                    
+                except Exception as e:
+                    logging.warning(f"Error checking moderator {moderator.name}: {e}")
+                    # Still add them but mark as unknown
+                    moderators.append({
+                        'username': moderator.name,
+                        'is_active': False,
+                        'permissions': ['unknown']
+                    })
+            
+            # Check for shared moderators with other analyzed subreddits
+            if self.airtable:
+                shared_mods = self.find_shared_moderators(subreddit_name, [m['username'] for m in moderators])
+            
+            # Save to Airtable
+            if self.airtable:
+                self.save_moderators_to_airtable(subreddit_name, moderators)
+            
+            return {
+                'success': True,
+                'subreddit': subreddit_name,
+                'moderators': moderators,
+                'moderator_count': len(moderators),
+                'active_moderators': len([m for m in moderators if m['is_active']]),
+                'shared_moderators': shared_mods,
+                'analyzed_at': datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logging.error(f"Error getting moderators for {subreddit_name}: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def find_shared_moderators(self, current_subreddit: str, current_mods: List[str]) -> List[Dict[str, Any]]:
+        """Find moderators shared with other analyzed subreddits"""
+        if not self.airtable:
+            return []
+        
+        try:
+            # Get all stored moderators from other subreddits
+            all_mods = self.mods_table.all(formula=f"{{Subreddit}}!='{current_subreddit}'")
+            
+            shared = []
+            subreddit_mod_map = {}
+            
+            # Group mods by subreddit
+            for record in all_mods:
+                fields = record['fields']
+                subreddit = fields.get('Subreddit', '')
+                mod_name = fields.get('Moderator_Username', '')
+                
+                if subreddit not in subreddit_mod_map:
+                    subreddit_mod_map[subreddit] = []
+                subreddit_mod_map[subreddit].append(mod_name)
+            
+            # Find shared moderators
+            for subreddit, mods in subreddit_mod_map.items():
+                shared_mod_names = [mod for mod in current_mods if mod in mods]
+                
+                if shared_mod_names:
+                    shared.append({
+                        'subreddit': subreddit,
+                        'shared_mods': shared_mod_names,
+                        'shared_count': len(shared_mod_names)
+                    })
+            
+            # Sort by number of shared mods (highest first)
+            shared.sort(key=lambda x: x['shared_count'], reverse=True)
+            
+            return shared
+            
+        except Exception as e:
+            logging.error(f"Error finding shared moderators: {e}")
+            return []
+
+    def save_moderators_to_airtable(self, subreddit_name: str, moderators: List[Dict]) -> bool:
+        """Save moderators to Airtable"""
+        if not self.airtable:
+            return False
+        
+        try:
+            # Delete existing records for this subreddit
+            existing = self.mods_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+            for record in existing:
+                self.mods_table.delete(record['id'])
+            
+            # Insert new moderator records
+            current_date = datetime.utcnow().strftime('%Y-%m-%d')
+            
+            for mod in moderators:
+                record_data = {
+                    'Subreddit': subreddit_name,
+                    'Moderator_Username': mod['username'],
+                    'Is_Active': mod['is_active'],
+                    'Permissions': ', '.join(mod['permissions']),
+                    'Last_Updated': current_date
+                }
+                
+                self.mods_table.create(record_data)
+            
+            logging.info(f"Saved {len(moderators)} moderators for r/{subreddit_name} to Airtable")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to save moderators to Airtable: {e}")
+            return False
+    
     def parse_compare_input(self, input_text: str) -> List[str]:
         """Parse flexible compare input formats"""
         cleaned = re.sub(r'\s+', ' ', input_text.strip())
         subreddits = re.split(r'[,\s]+', cleaned)
         return [sub.strip() for sub in subreddits if sub.strip()]
-    
+
     async def analyze_multiple_concurrent(self, subreddits: list, days: int = 7):
         """Analyze multiple subreddits concurrently"""
         loop = asyncio.get_event_loop()
@@ -1589,6 +1747,8 @@ class RedditAnalyzer:
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if not isinstance(r, Exception)]
+    
+    
 
 # Initialize analyzer
 analyzer = RedditAnalyzer()
@@ -2115,6 +2275,27 @@ def get_subreddit_rules():
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/mods', methods=['POST'])
+def get_mods_endpoint():
+    """Get subreddit moderators and check for shared mods with analyzed subreddits"""
+    data = request.json
+    subreddit_name = data.get('subreddit')
+    
+    if not subreddit_name:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    # Validate subreddit exists
+    validation = validate_subreddit(subreddit_name)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    result = analyzer.get_subreddit_moderators(subreddit_name)
+    return jsonify(result)
 
 @app.route('/flairs', methods=['POST'])
 def analyze_flairs():
