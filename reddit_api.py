@@ -1595,119 +1595,167 @@ class RedditAnalyzer:
     def scrape_moderators_fallback(self, subreddit_name: str) -> Dict[str, Any]:
         """Fallback method to scrape moderators from Reddit's web interface"""
         try:
-            url = f"https://www.reddit.com/r/{subreddit_name}/about/moderators/"
+            # Try multiple URL patterns
+            urls_to_try = [
+                f"https://old.reddit.com/r/{subreddit_name}/about/moderators",
+                f"https://www.reddit.com/r/{subreddit_name}/about/moderators/",
+                f"https://old.reddit.com/r/{subreddit_name}/about/moderators/"
+            ]
             
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
             }
             
-            response = requests.get(url, headers=headers, timeout=10)
+            session = requests.Session()
+            session.headers.update(headers)
             
-            if response.status_code == 404:
-                return {
-                    'success': False,
-                    'error': f'Subreddit r/{subreddit_name} not found',
-                    'error_type': 'not_found'
-                }
-            elif response.status_code == 403:
-                return {
-                    'success': False,
-                    'error': f'r/{subreddit_name} is private or restricted',
-                    'error_type': 'private'
-                }
-            elif response.status_code != 200:
-                return {
-                    'success': False,
-                    'error': f'HTTP {response.status_code} error accessing subreddit',
-                    'error_type': 'http_error'
-                }
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            moderators = []
-            
-            # Method 1: Try to find moderators in JSON data
-            json_scripts = soup.find_all('script', string=re.compile(r'moderators'))
-            
-            for script in json_scripts:
-                if 'moderators' in script.string:
-                    try:
-                        # Extract JSON data containing moderators
-                        import json
-                        
-                        # Look for moderator usernames in the JSON
-                        matches = re.findall(r'"name":"([^"]+)"', script.string)
-                        
-                        for username in matches:
-                            if len(username) > 2 and not username.startswith('t3_'):  # Filter out post IDs
-                                moderators.append({
-                                    'username': username,
-                                    'is_active': True,  # Assume active
-                                    'permissions': ['unknown']
-                                })
-                        
-                        if moderators:
-                            break
-                            
-                    except Exception as e:
-                        logging.warning(f"Error parsing JSON for moderators: {e}")
-                        continue
-            
-            # Method 2: Try CSS selectors (backup method)
-            if not moderators:
+            for url in urls_to_try:
                 try:
-                    # Look for moderator links/usernames in HTML
-                    mod_links = soup.find_all('a', href=re.compile(r'/user/'))
+                    logging.info(f"Trying URL: {url}")
+                    response = session.get(url, timeout=15, allow_redirects=True)
                     
-                    for link in mod_links:
-                        href = link.get('href', '')
-                        if '/user/' in href:
-                            username = href.split('/user/')[-1].split('/')[0]
-                            if username and len(username) > 2:
+                    logging.info(f"Response status: {response.status_code}")
+                    
+                    if response.status_code == 404:
+                        continue  # Try next URL
+                    elif response.status_code == 403:
+                        continue  # Try next URL
+                    elif response.status_code != 200:
+                        continue  # Try next URL
+                    
+                    # Check if we got redirected to login or error page
+                    if 'reddit.com/login' in response.url or 'reddit.com/subreddits/search' in response.url:
+                        continue  # Try next URL
+                    
+                    content = response.text
+                    moderators = []
+                    
+                    # Method 1: Look for old Reddit moderator list
+                    if 'old.reddit.com' in url:
+                        # Parse old Reddit format
+                        soup = BeautifulSoup(content, 'html.parser')
+                        mod_elements = soup.find_all('a', class_='author')
+                        
+                        for mod_element in mod_elements:
+                            username = mod_element.get_text().strip()
+                            if username and len(username) > 0 and not username.startswith('['):
                                 moderators.append({
                                     'username': username,
                                     'is_active': True,
                                     'permissions': ['unknown']
                                 })
                     
-                    # Remove duplicates
-                    seen = set()
-                    unique_mods = []
-                    for mod in moderators:
-                        if mod['username'] not in seen:
-                            seen.add(mod['username'])
-                            unique_mods.append(mod)
-                    moderators = unique_mods
+                    # Method 2: Look for JSON data in scripts
+                    if not moderators:
+                        import json
+                        import re
+                        
+                        # Find JSON data containing moderators
+                        json_patterns = [
+                            r'"moderators":\s*(\[.*?\])',
+                            r'"data":\s*{[^}]*"moderators":\s*(\[.*?\])',
+                            r'window\.__r\s*=\s*({.*?});'
+                        ]
+                        
+                        for pattern in json_patterns:
+                            matches = re.findall(pattern, content, re.DOTALL)
+                            for match in matches:
+                                try:
+                                    if match.startswith('['):
+                                        mod_data = json.loads(match)
+                                    else:
+                                        data = json.loads(match)
+                                        # Navigate through the JSON to find moderators
+                                        # This is a simplified approach
+                                        continue
+                                    
+                                    for mod in mod_data:
+                                        if isinstance(mod, dict) and 'name' in mod:
+                                            moderators.append({
+                                                'username': mod['name'],
+                                                'is_active': True,
+                                                'permissions': ['unknown']
+                                            })
+                                        elif isinstance(mod, str):
+                                            moderators.append({
+                                                'username': mod,
+                                                'is_active': True,
+                                                'permissions': ['unknown']
+                                            })
+                                            
+                                    break
+                                except:
+                                    continue
                     
+                    # Method 3: Look for usernames in links
+                    if not moderators:
+                        soup = BeautifulSoup(content, 'html.parser')
+                        user_links = soup.find_all('a', href=re.compile(r'/u(?:ser)?/'))
+                        
+                        seen_users = set()
+                        for link in user_links:
+                            href = link.get('href', '')
+                            username_match = re.search(r'/u(?:ser)?/([^/?]+)', href)
+                            if username_match:
+                                username = username_match.group(1)
+                                if (username and len(username) > 2 and 
+                                    username not in seen_users and
+                                    not username.startswith('t3_') and
+                                    username.isalnum() or '_' in username):
+                                    
+                                    seen_users.add(username)
+                                    moderators.append({
+                                        'username': username,
+                                        'is_active': True,
+                                        'permissions': ['unknown']
+                                    })
+                                    
+                                    if len(moderators) >= 20:  # Reasonable limit
+                                        break
+                    
+                    # If we found moderators, return them
+                    if moderators:
+                        # Remove duplicates
+                        seen = set()
+                        unique_mods = []
+                        for mod in moderators:
+                            if mod['username'] not in seen:
+                                seen.add(mod['username'])
+                                unique_mods.append(mod)
+                        
+                        logging.info(f"Found {len(unique_mods)} moderators using web scraping")
+                        
+                        return {
+                            'success': True,
+                            'subreddit': subreddit_name,
+                            'moderators': unique_mods[:15],  # Limit to 15
+                            'moderator_count': len(unique_mods),
+                            'active_moderators': len(unique_mods),
+                            'method': 'web_scraping',
+                            'analyzed_at': datetime.utcnow().isoformat()
+                        }
+                    
+                except requests.RequestException as e:
+                    logging.warning(f"Request failed for {url}: {e}")
+                    continue
                 except Exception as e:
-                    logging.warning(f"Error parsing HTML for moderators: {e}")
+                    logging.warning(f"Parsing failed for {url}: {e}")
+                    continue
             
-            if not moderators:
-                return {
-                    'success': False,
-                    'error': 'Could not find moderator information on the page',
-                    'error_type': 'parsing_failed'
-                }
-            
-            logging.info(f"Web scraping found {len(moderators)} moderators for r/{subreddit_name}")
-            
-            return {
-                'success': True,
-                'subreddit': subreddit_name,
-                'moderators': moderators[:20],  # Limit to 20 to avoid spam
-                'moderator_count': len(moderators),
-                'active_moderators': len(moderators),
-                'method': 'web_scraping',
-                'analyzed_at': datetime.utcnow().isoformat()
-            }
-            
-        except requests.Timeout:
+            # If all methods failed
             return {
                 'success': False,
-                'error': 'Request timeout while scraping moderators',
-                'error_type': 'timeout'
+                'error': f'Could not access moderator information for r/{subreddit_name}. Reddit may be blocking automated access.',
+                'error_type': 'scraping_blocked'
             }
+            
         except Exception as e:
-            logging.error(f"Error scraping moderators for {subreddit_name}: {e}")
+            logging.error(f"Web scraping completely failed for {subreddit_name}: {e}")
             return {
                 'success': False,
                 'error': f'Web scraping failed: {str(e)}',
