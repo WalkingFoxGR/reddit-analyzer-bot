@@ -87,6 +87,10 @@ class RedditAnalyzer:
         # Test connection on initialization
         self.test_connection()
     
+    def normalize_subreddit_name(self, subreddit_name: str) -> str:
+        """Normalize subreddit name to lowercase for consistent storage"""
+        return subreddit_name.lower().strip()
+
     def _create_reddit_instance(self):
         """Create a fresh Reddit instance"""
         return praw.Reddit(
@@ -645,14 +649,17 @@ class RedditAnalyzer:
         
         try:
             subreddit_name = analysis_data['subreddit']
+            display_name = subreddit_name  # Keep original for display
+            normalized_name = self.normalize_subreddit_name(subreddit_name)  # Use normalized for storage
             
-            # Check if record exists
-            existing = self.karma_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
+            # Check if record exists using normalized name
+            existing = self.karma_table.all(formula=f"{{Subreddit}}='{normalized_name}'")
             current_date = datetime.utcnow().strftime('%Y-%m-%d')
             
-            # Prepare the record data with enhanced metrics
+            # Prepare the record data with both normalized and display names
             record_data = {
-                'Subreddit': subreddit_name,
+                'Subreddit': normalized_name,  # Store normalized version
+                'Display_Name': display_name,   # Store original capitalization
                 'Subscribers': analysis_data.get('subscribers', 0),
                 'Effectiveness_Score': analysis_data.get('effectiveness_score', 0),
                 'Avg_Posts_Per_Day': analysis_data.get('avg_posts_per_day', 0),
