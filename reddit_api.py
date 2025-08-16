@@ -1590,6 +1590,45 @@ class RedditAnalyzer:
             logging.error(f"Error analyzing user {username}: {e}")
             return {'success': False, 'error': str(e)}
     
+    # Quick test function
+    def test_moderator_access(self, subreddit_name: str):
+        """Test moderator access with both methods"""
+        results = {}
+        
+        # Method 1: Try PRAW
+        try:
+            subreddit = self.enhanced_safe_reddit_call(
+                lambda: self.reddit.subreddit(subreddit_name)
+            )
+            mods = list(subreddit.moderator())
+            results['praw'] = {
+                'success': True,
+                'count': len(mods),
+                'moderators': [m.name for m in mods]
+            }
+        except Exception as e:
+            results['praw'] = {'success': False, 'error': str(e)}
+        
+        # Method 2: Public endpoint
+        try:
+            import requests
+            url = f"https://www.reddit.com/r/{subreddit_name}/about/moderators.json"
+            response = requests.get(url, headers={'User-Agent': 'RedditAnalyzer/1.0'})
+            if response.status_code == 200:
+                data = response.json()
+                mods = [child['data']['name'] for child in data.get('data', {}).get('children', [])]
+                results['public'] = {
+                    'success': True,
+                    'count': len(mods),
+                    'moderators': mods
+                }
+            else:
+                results['public'] = {'success': False, 'error': response.status_code}
+        except Exception as e:
+            results['public'] = {'success': False, 'error': str(e)}
+        
+        return results
+
     def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
         """Get moderators of a subreddit"""
         try:
