@@ -16,6 +16,8 @@ from pyairtable import Api
 import statistics
 from contextlib import contextmanager
 from threading import Semaphore
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -77,6 +79,9 @@ class RedditAnalyzer:
             'television', 'books', 'art', 'food', 'jokes', 'tifu',
             'showerthoughts', 'iama', 'all', 'popular', 'random'
         }
+        
+        # Add thread pool for concurrent operations
+        self.thread_executor = ThreadPoolExecutor(max_workers=5)
         
         # Test connection on initialization
         self.test_connection()
@@ -1575,6 +1580,23 @@ class RedditAnalyzer:
         cleaned = re.sub(r'\s+', ' ', input_text.strip())
         subreddits = re.split(r'[,\s]+', cleaned)
         return [sub.strip() for sub in subreddits if sub.strip()]
+    
+    async def analyze_multiple_concurrent(self, subreddits: list, days: int = 7):
+        """Analyze multiple subreddits concurrently"""
+        loop = asyncio.get_event_loop()
+        
+        tasks = []
+        for subreddit in subreddits:
+            task = loop.run_in_executor(
+                self.thread_executor,
+                self.analyze_subreddit_enhanced,
+                subreddit,
+                days
+            )
+            tasks.append(task)
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in results if not isinstance(r, Exception)]
 
 # Initialize analyzer
 analyzer = RedditAnalyzer()
