@@ -86,7 +86,7 @@ class RedditAnalyzer:
         
         # Test connection on initialization
         self.test_connection()
-    
+
     def normalize_subreddit_name(self, subreddit_name: str) -> str:
         """Normalize subreddit name to lowercase for consistent storage"""
         if not subreddit_name:
@@ -95,6 +95,18 @@ class RedditAnalyzer:
         name = subreddit_name.replace('r/', '').replace('/r/', '')
         return name.lower().strip()
 
+    def get_existing_record(self, subreddit_name: str):
+        """Get existing record using case-insensitive search"""
+        normalized = self.normalize_subreddit_name(subreddit_name)
+        # Use LOWER() function in Airtable formula for case-insensitive comparison
+        formula = f"LOWER({{Subreddit}})='{normalized}'"
+        try:
+            existing = self.karma_table.all(formula=formula)
+            return existing[0] if existing else None
+        except Exception as e:
+            logging.error(f"Error checking existing record: {e}")
+            return None
+    
     def _create_reddit_instance(self):
         """Create a fresh Reddit instance"""
         return praw.Reddit(
@@ -645,20 +657,8 @@ class RedditAnalyzer:
                                                avg_comments_per_post, subscribers)
         return result['effectiveness_score']
     
-    def get_existing_record(self, subreddit_name: str):
-        """Get existing record using case-insensitive search"""
-        normalized = self.normalize_subreddit_name(subreddit_name)
-        # Use LOWER() function in Airtable formula for case-insensitive comparison
-        formula = f"LOWER({{Subreddit}})='{normalized}'"
-        try:
-            existing = self.karma_table.all(formula=formula)
-            return existing[0] if existing else None
-        except Exception as e:
-            logging.error(f"Error checking existing record: {e}")
-            return None
-
     def save_analyze_to_airtable(self, analysis_data: Dict[str, Any]) -> bool:
-        """Save enhanced analyze metrics to Airtable"""
+        """Save enhanced analyze metrics to Airtable with case-insensitive handling"""
         if not self.airtable:
             logging.warning("Airtable not initialized, skipping save")
             return False
@@ -672,7 +672,7 @@ class RedditAnalyzer:
             existing_record = self.get_existing_record(subreddit_name)
             current_date = datetime.utcnow().strftime('%Y-%m-%d')
             
-            # Prepare the record data
+            # Prepare the record data with enhanced metrics
             record_data = {
                 'Subreddit': normalized_name,  # Always store lowercase
                 'Display_Name': display_name,   # Keep original capitalization
@@ -680,8 +680,8 @@ class RedditAnalyzer:
                 'Effectiveness_Score': analysis_data.get('effectiveness_score', 0),
                 'Avg_Posts_Per_Day': analysis_data.get('avg_posts_per_day', 0),
                 'Avg_Score_Per_Post': analysis_data.get('avg_score_per_post', 0),
-                'Median_Score_Per_Post': analysis_data.get('median_score_per_post', 0),
-                'Trimmed_Mean_Score': analysis_data.get('trimmed_mean_score', 0),
+                'Median_Score_Per_Post': analysis_data.get('median_score_per_post', 0),  # NEW
+                'Trimmed_Mean_Score': analysis_data.get('trimmed_mean_score', 0),        # NEW
                 'Avg_Comments_Per_Post': analysis_data.get('avg_comments_per_post', 0),
                 'Days_Analyzed': analysis_data.get('days_analyzed', 7),
                 'Is_NSFW': analysis_data.get('is_nsfw', False),
@@ -748,9 +748,12 @@ class RedditAnalyzer:
                 
                 record_data['Posts_Analyzed_For_Timing'] = posting_times.get('posts_analyzed', 0)
 
+            # Update existing record or create new one
             if existing_record:
-                # Preserve karma requirements if they exist
-                existing_fields = existing_record['fields']
+                # Keep existing karma requirements data
+                existing_data = existing_record['fields']
+                
+                # Preserve karma requirements fields if they exist
                 karma_fields = [
                     'Post_Karma_Min', 'Comment_Karma_Min', 'Account_Age_Days',
                     'Confidence', 'Requires_Verification', 'Verification_Method',
@@ -758,8 +761,8 @@ class RedditAnalyzer:
                 ]
                 
                 for field in karma_fields:
-                    if field in existing_fields and field not in record_data:
-                        record_data[field] = existing_fields[field]
+                    if field in existing_data:
+                        record_data[field] = existing_data[field]
                 
                 # Update the record
                 updated = self.karma_table.update(existing_record['id'], record_data)
@@ -772,7 +775,7 @@ class RedditAnalyzer:
             return True
             
         except Exception as e:
-            logging.error(f"Failed to save to Airtable: {e}")
+            logging.error(f"Failed to save enhanced data to Airtable for {subreddit_name}: {e}")
             return False
     
     def analyze_posting_times(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
@@ -1004,48 +1007,48 @@ class RedditAnalyzer:
                 'error': str(e)
             }
     
-def analyze_karma_requirements(self, subreddit_name: str, post_limit: int = 150) -> Dict[str, Any]:
-    """Analyze karma requirements with configurable post limit"""
-    
-    # Check Airtable cache first with normalized name
-    if self.airtable:
-        try:
-            existing_record = self.get_existing_record(subreddit_name)
-            if existing_record:
-                record = existing_record['fields']
-                
-                try:
-                    last_updated_str = record.get('Last_Updated', '2000-01-01')
-                    if 'T' in last_updated_str:
-                        last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
+    def analyze_karma_requirements(self, subreddit_name: str, post_limit: int = 150) -> Dict[str, Any]:
+        """Analyze karma requirements with configurable post limit and case-insensitive caching"""
+        
+        # Check Airtable cache first with normalized name
+        if self.airtable:
+            try:
+                existing_record = self.get_existing_record(subreddit_name)
+                if existing_record:
+                    record = existing_record['fields']
+                    
+                    try:
+                        last_updated_str = record.get('Last_Updated', '2000-01-01')
+                        if 'T' in last_updated_str:
+                            last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
+                        else:
+                            last_updated = datetime.strptime(last_updated_str, '%Y-%m-%d')
+                            
+                        if last_updated.tzinfo is None:
+                            last_updated = last_updated.replace(tzinfo=timezone.utc)
+                            
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Date parsing error: {e}")
+                        last_updated = datetime(2000, 1, 1, tzinfo=timezone.utc)
+                    
+                    if (datetime.now(timezone.utc) - last_updated).days < 30:
+                        logging.info(f"Using cached karma data for {subreddit_name}")
+                        return {
+                            'success': True,
+                            'from_cache': True,
+                            'post_karma_min': record.get('Post_Karma_Min', 0),
+                            'comment_karma_min': record.get('Comment_Karma_Min', 0),
+                            'account_age_days': record.get('Account_Age_Days', 0),
+                            'confidence': record.get('Confidence', 'Unknown'),
+                            'requires_verification': record.get('Requires_Verification', False),
+                            'verification_method': record.get('Verification_Method', 'unknown'),
+                            'verification_optional': record.get('Verification_Optional', False),
+                            'verification_note': record.get('Verification_Note', 'standard')
+                        }
                     else:
-                        last_updated = datetime.strptime(last_updated_str, '%Y-%m-%d')
-                        
-                    if last_updated.tzinfo is None:
-                        last_updated = last_updated.replace(tzinfo=timezone.utc)
-                        
-                except (ValueError, TypeError) as e:
-                    logging.warning(f"Date parsing error: {e}")
-                    last_updated = datetime(2000, 1, 1, tzinfo=timezone.utc)
-                
-                if (datetime.now(timezone.utc) - last_updated).days < 30:
-                    logging.info(f"Using cached karma data for {subreddit_name}")
-                    return {
-                        'success': True,
-                        'from_cache': True,
-                        'post_karma_min': record.get('Post_Karma_Min', 0),
-                        'comment_karma_min': record.get('Comment_Karma_Min', 0),
-                        'account_age_days': record.get('Account_Age_Days', 0),
-                        'confidence': record.get('Confidence', 'Unknown'),
-                        'requires_verification': record.get('Requires_Verification', False),
-                        'verification_method': record.get('Verification_Method', 'unknown'),
-                        'verification_optional': record.get('Verification_Optional', False),
-                        'verification_note': record.get('Verification_Note', 'standard')
-                    }
-                else:
-                    logging.info(f"Cached data for {subreddit_name} is too old, analyzing fresh")
-        except Exception as e:
-            logging.warning(f"Airtable cache read failed: {e}")
+                        logging.info(f"Cached data for {subreddit_name} is too old, analyzing fresh")
+            except Exception as e:
+                logging.warning(f"Airtable cache read failed: {e}")
         
         # Analyze if not cached or cache failed
         try:
@@ -1125,49 +1128,50 @@ def analyze_karma_requirements(self, subreddit_name: str, post_limit: int = 150)
                 'posts_scraped': post_limit
             }
             
+            # Save to Airtable with new fields and case-insensitive handling
             if self.airtable:
-                    try:
-                        normalized_name = self.normalize_subreddit_name(subreddit_name)
-                        display_name = subreddit_name
-                        existing_record = self.get_existing_record(subreddit_name)
-                        current_date = datetime.utcnow().strftime('%Y-%m-%d')
+                try:
+                    normalized_name = self.normalize_subreddit_name(subreddit_name)
+                    display_name = subreddit_name
+                    existing_record = self.get_existing_record(subreddit_name)
+                    current_date = datetime.utcnow().strftime('%Y-%m-%d')
+                    
+                    record_data = {
+                        'Subreddit': normalized_name,  # Normalized
+                        'Display_Name': display_name,   # Original
+                        'Post_Karma_Min': result['post_karma_min'],
+                        'Comment_Karma_Min': result['comment_karma_min'],
+                        'Account_Age_Days': result['account_age_days'],
+                        'Confidence': result['confidence'],
+                        'Requires_Verification': result['requires_verification'],
+                        'Verification_Method': result['verification_method'],
+                        'Verification_Optional': result['verification_optional'],
+                        'Verification_Note': result['verification_note'],
+                        'Last_Updated': current_date,
+                        'Posts_Analyzed': post_limit
+                    }
+                    
+                    if existing_record:
+                        # Preserve analyze data if it exists
+                        existing_fields = existing_record['fields']
+                        analyze_fields = [
+                            'Subscribers', 'Effectiveness_Score', 'Avg_Posts_Per_Day',
+                            'Avg_Score_Per_Post', 'Median_Score_Per_Post', 'Avg_Comments_Per_Post',
+                            'Is_NSFW', 'Last_Analyzed'
+                        ]
                         
-                        record_data = {
-                            'Subreddit': normalized_name,  # Normalized
-                            'Display_Name': display_name,   # Original
-                            'Post_Karma_Min': result['post_karma_min'],
-                            'Comment_Karma_Min': result['comment_karma_min'],
-                            'Account_Age_Days': result['account_age_days'],
-                            'Confidence': result['confidence'],
-                            'Requires_Verification': result['requires_verification'],
-                            'Verification_Method': result['verification_method'],
-                            'Verification_Optional': result['verification_optional'],
-                            'Verification_Note': result['verification_note'],
-                            'Last_Updated': current_date,
-                            'Posts_Analyzed': post_limit
-                        }
+                        for field in analyze_fields:
+                            if field in existing_fields and field not in record_data:
+                                record_data[field] = existing_fields[field]
                         
-                        if existing_record:
-                            # Preserve analyze data if it exists
-                            existing_fields = existing_record['fields']
-                            analyze_fields = [
-                                'Subscribers', 'Effectiveness_Score', 'Avg_Posts_Per_Day',
-                                'Avg_Score_Per_Post', 'Median_Score_Per_Post', 'Avg_Comments_Per_Post',
-                                'Is_NSFW', 'Last_Analyzed'
-                            ]
+                        updated = self.karma_table.update(existing_record['id'], record_data)
+                        logging.info(f"Updated karma requirements for {display_name}")
+                    else:
+                        created = self.karma_table.create(record_data)
+                        logging.info(f"Created karma requirements for {display_name}")
                             
-                            for field in analyze_fields:
-                                if field in existing_fields and field not in record_data:
-                                    record_data[field] = existing_fields[field]
-                            
-                            updated = self.karma_table.update(existing_record['id'], record_data)
-                            logging.info(f"Updated karma requirements for {display_name}")
-                        else:
-                            created = self.karma_table.create(record_data)
-                            logging.info(f"Created karma requirements for {display_name}")
-                                
-                    except Exception as e:
-                        logging.error(f"Airtable save failed for {subreddit_name}: {e}")
+                except Exception as e:
+                    logging.error(f"Airtable save failed for {subreddit_name}: {e}")
             
             return result
             
