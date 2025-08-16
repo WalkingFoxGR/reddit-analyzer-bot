@@ -18,6 +18,8 @@ from contextlib import contextmanager
 from threading import Semaphore
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+import requests  # Add this
+from bs4 import BeautifulSoup  # Add this
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -1589,91 +1591,183 @@ class RedditAnalyzer:
         except Exception as e:
             logging.error(f"Error analyzing user {username}: {e}")
             return {'success': False, 'error': str(e)}
-    
-    # Quick test function
-    def test_moderator_access(self, subreddit_name: str):
-        """Test moderator access with both methods"""
-        results = {}
-        
-        # Method 1: Try PRAW
-        try:
-            subreddit = self.enhanced_safe_reddit_call(
-                lambda: self.reddit.subreddit(subreddit_name)
-            )
-            mods = list(subreddit.moderator())
-            results['praw'] = {
-                'success': True,
-                'count': len(mods),
-                'moderators': [m.name for m in mods]
-            }
-        except Exception as e:
-            results['praw'] = {'success': False, 'error': str(e)}
-        
-        # Method 2: Public endpoint
-        try:
-            import requests
-            url = f"https://www.reddit.com/r/{subreddit_name}/about/moderators.json"
-            response = requests.get(url, headers={'User-Agent': 'RedditAnalyzer/1.0'})
-            if response.status_code == 200:
-                data = response.json()
-                mods = [child['data']['name'] for child in data.get('data', {}).get('children', [])]
-                results['public'] = {
-                    'success': True,
-                    'count': len(mods),
-                    'moderators': mods
-                }
-            else:
-                results['public'] = {'success': False, 'error': response.status_code}
-        except Exception as e:
-            results['public'] = {'success': False, 'error': str(e)}
-        
-        return results
 
-    def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
-        """Get moderators of a subreddit"""
+    def scrape_moderators_fallback(self, subreddit_name: str) -> Dict[str, Any]:
+        """Fallback method to scrape moderators from Reddit's web interface"""
         try:
-            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            url = f"https://www.reddit.com/r/{subreddit_name}/about/moderators/"
             
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 404:
+                return {
+                    'success': False,
+                    'error': f'Subreddit r/{subreddit_name} not found',
+                    'error_type': 'not_found'
+                }
+            elif response.status_code == 403:
+                return {
+                    'success': False,
+                    'error': f'r/{subreddit_name} is private or restricted',
+                    'error_type': 'private'
+                }
+            elif response.status_code != 200:
+                return {
+                    'success': False,
+                    'error': f'HTTP {response.status_code} error accessing subreddit',
+                    'error_type': 'http_error'
+                }
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
             moderators = []
-            shared_mods = []
             
-            # Get moderators
-            for moderator in subreddit.moderator():
-                try:
-                    # Check if moderator account still exists/is active
-                    mod_user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(moderator.name))
-                    
-                    # Try to access their profile to check if suspended
+            # Method 1: Try to find moderators in JSON data
+            json_scripts = soup.find_all('script', string=re.compile(r'moderators'))
+            
+            for script in json_scripts:
+                if 'moderators' in script.string:
                     try:
-                        _ = mod_user.created_utc  # This will fail if suspended
-                        is_active = True
-                    except:
-                        is_active = False
+                        # Extract JSON data containing moderators
+                        import json
+                        
+                        # Look for moderator usernames in the JSON
+                        matches = re.findall(r'"name":"([^"]+)"', script.string)
+                        
+                        for username in matches:
+                            if len(username) > 2 and not username.startswith('t3_'):  # Filter out post IDs
+                                moderators.append({
+                                    'username': username,
+                                    'is_active': True,  # Assume active
+                                    'permissions': ['unknown']
+                                })
+                        
+                        if moderators:
+                            break
+                            
+                    except Exception as e:
+                        logging.warning(f"Error parsing JSON for moderators: {e}")
+                        continue
+            
+            # Method 2: Try CSS selectors (backup method)
+            if not moderators:
+                try:
+                    # Look for moderator links/usernames in HTML
+                    mod_links = soup.find_all('a', href=re.compile(r'/user/'))
                     
-                    mod_data = {
-                        'username': moderator.name,
-                        'is_active': is_active,
-                        'permissions': list(moderator.mod_permissions) if hasattr(moderator, 'mod_permissions') else ['unknown']
-                    }
-                    moderators.append(mod_data)
+                    for link in mod_links:
+                        href = link.get('href', '')
+                        if '/user/' in href:
+                            username = href.split('/user/')[-1].split('/')[0]
+                            if username and len(username) > 2:
+                                moderators.append({
+                                    'username': username,
+                                    'is_active': True,
+                                    'permissions': ['unknown']
+                                })
                     
-                    time.sleep(0.1)  # Rate limiting
+                    # Remove duplicates
+                    seen = set()
+                    unique_mods = []
+                    for mod in moderators:
+                        if mod['username'] not in seen:
+                            seen.add(mod['username'])
+                            unique_mods.append(mod)
+                    moderators = unique_mods
                     
                 except Exception as e:
-                    logging.warning(f"Error checking moderator {moderator.name}: {e}")
-                    # Still add them but mark as unknown
+                    logging.warning(f"Error parsing HTML for moderators: {e}")
+            
+            if not moderators:
+                return {
+                    'success': False,
+                    'error': 'Could not find moderator information on the page',
+                    'error_type': 'parsing_failed'
+                }
+            
+            logging.info(f"Web scraping found {len(moderators)} moderators for r/{subreddit_name}")
+            
+            return {
+                'success': True,
+                'subreddit': subreddit_name,
+                'moderators': moderators[:20],  # Limit to 20 to avoid spam
+                'moderator_count': len(moderators),
+                'active_moderators': len(moderators),
+                'method': 'web_scraping',
+                'analyzed_at': datetime.utcnow().isoformat()
+            }
+            
+        except requests.Timeout:
+            return {
+                'success': False,
+                'error': 'Request timeout while scraping moderators',
+                'error_type': 'timeout'
+            }
+        except Exception as e:
+            logging.error(f"Error scraping moderators for {subreddit_name}: {e}")
+            return {
+                'success': False,
+                'error': f'Web scraping failed: {str(e)}',
+                'error_type': 'scraping_error'
+            }
+
+    def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
+        """Get moderators of a subreddit with API + web scraping fallback"""
+        try:
+            # First try the Reddit API
+            logging.info(f"Attempting Reddit API for r/{subreddit_name} moderators")
+            
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            # Verify subreddit exists
+            try:
+                _ = subreddit.subscribers
+            except Exception as e:
+                if "404" in str(e) or "not found" in str(e).lower():
+                    return {'success': False, 'error': f'Subreddit r/{subreddit_name} not found'}
+                elif "403" in str(e) or "private" in str(e).lower():
+                    return {'success': False, 'error': f'Subreddit r/{subreddit_name} is private'}
+            
+            moderators = []
+            
+            try:
+                # Try Reddit API first
+                for moderator in subreddit.moderator():
                     moderators.append({
                         'username': moderator.name,
-                        'is_active': False,
-                        'permissions': ['unknown']
+                        'is_active': True,
+                        'permissions': list(getattr(moderator, 'mod_permissions', ['unknown']))
                     })
+                
+                if moderators:
+                    logging.info(f"Reddit API success: Found {len(moderators)} moderators")
+                    method = 'reddit_api'
+                else:
+                    raise Exception("Empty moderator list from API")
+                    
+            except Exception as api_error:
+                logging.warning(f"Reddit API failed for r/{subreddit_name}: {api_error}")
+                
+                # Fallback to web scraping
+                logging.info(f"Falling back to web scraping for r/{subreddit_name}")
+                scrape_result = self.scrape_moderators_fallback(subreddit_name)
+                
+                if not scrape_result['success']:
+                    return scrape_result
+                
+                moderators = scrape_result['moderators']
+                method = 'web_scraping'
             
-            # Check for shared moderators with other analyzed subreddits
+            # Check for shared moderators
+            shared_mods = []
             if self.airtable:
                 shared_mods = self.find_shared_moderators(subreddit_name, [m['username'] for m in moderators])
             
             # Save to Airtable
-            if self.airtable:
+            if self.airtable and moderators:
                 self.save_moderators_to_airtable(subreddit_name, moderators)
             
             return {
@@ -1683,6 +1777,7 @@ class RedditAnalyzer:
                 'moderator_count': len(moderators),
                 'active_moderators': len([m for m in moderators if m['is_active']]),
                 'shared_moderators': shared_mods,
+                'method': method,
                 'analyzed_at': datetime.utcnow().isoformat()
             }
             
