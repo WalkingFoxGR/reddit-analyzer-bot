@@ -18,8 +18,6 @@ from contextlib import contextmanager
 from threading import Semaphore
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
-import requests  # Add this
-from bs4 import BeautifulSoup  # Add this
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +37,6 @@ class RedditAnalyzer:
             try:
                 self.airtable = Api(api_key)
                 self.karma_table = self.airtable.table(base_id, 'Karma Requirements')
-                self.mods_table = self.airtable.table(base_id, 'Moderators')  # NEW TABLE
                 logging.info("Airtable initialized successfully")
             except Exception as e:
                 logging.error(f"Failed to initialize Airtable: {e}")
@@ -254,32 +251,10 @@ class RedditAnalyzer:
             
             # Check for NSFW keywords in subreddit name/description
             nsfw_keywords = [
-                'nsfw', 'porn', 'sex', 'xxx', 'nude', 'naked', 'boobs', 'ass', 'pussy',
+                'nsfw', 'porn', 'sex', 'xxx', 'nude', 'naked', 'boobs', 'ass', 'pussy', 
                 'cock', 'dick', 'penis', 'vagina', 'tits', 'fetish', 'kink', 'erotic',
-                'gonewild', 'amateur', 'milf', 'teen', 'gay', 'lesbian', 'bdsm', 'anal',
-                'oral', 'cumshot', 'masturbat', 'orgasm', 'handjob', 'blowjob', 'anus',
-                'areola', 'balls', 'breasts', 'butt', 'clitoris', 'labia', 'nipples',
-                'nipple', 'scrotum', 'testicles', 'testicle', 'vag', 'urethra', 'anal sex',
-                'bukkake', 'cunnilingus', 'fellatio', 'gangbang', 'deepthroat', 'dp',
-                'double penetration', '69', 'fingering', 'fisting', 'rimjob', 'rimming',
-                'creampie', 'cream pie', 'facial', 'facefuck', 'face fuck', 'cum', 'jizz',
-                'splooge', 'spunk', 'squirting', 'cumdrip', 'cumslut', 'cumstain',
-                'cumming', 'dildo', 'vibrator', 'buttplug', 'strapon', 'strap-on',
-                'cockring', 'anal beads', 'anus beads', 'escort', 'call girl', 'callgirl',
-                'sex work', 'prostitute', 'hooker', 'pimp', 'gigolo', 'pornhub', 'xvideos',
-                'xhamster', 'youporn', 'redtube', 'xnxx', 'tnaflix', 'brazzers',
-                'bangbros', 'naughtyamerica', 'naughty america', 'evilangel', 'bondage',
-                'spanking', 'sadomasochism', 'sadism', 'latex', 'leather', 'roleplay',
-                'voyeur', 'exhibitionism', 'watersports', 'urophilia', 'scat',
-                'foot fetish', 'footfetish', 'clothed male x female', 'furry', 'yiff',
-                'hentai', 'ecchi', 'yaoi', 'yuri', 'rape', 'incest', 'bestiality',
-                'zoophilia', 'cp', 'child porn', 'childporn', 'pedo', 'pedophile',
-                'underage', 'minor', 'barely legal', 'barelylegal', 'transgender',
-                'transsexual', 'trans', 'tranny', 'shemale', 'trap', 'slut', 'whore',
-                'thot', 'bareback', 'exhibitionist', 'masturbation', 'masturbator',
-                'pornography', 'pornographic', 'softcore', 'hardcore', 'striptease',
-                'pole dance', 'pole dancing', 'onlyfans', 'camgirl', 'camboy', 'webcam',
-                'sex tape', 'sex video'
+                'gonewild', 'amateur', 'milf', 'teen', 'gay', 'lesbian', 'bdsm',
+                'anal', 'oral', 'cumshot', 'masturbat', 'orgasm', 'handjob', 'blowjob'
             ]
             
             sub_name_lower = subreddit_name.lower()
@@ -1591,328 +1566,13 @@ class RedditAnalyzer:
         except Exception as e:
             logging.error(f"Error analyzing user {username}: {e}")
             return {'success': False, 'error': str(e)}
-
-    def scrape_moderators_fallback(self, subreddit_name: str) -> Dict[str, Any]:
-        """Fallback method to scrape moderators from Reddit's web interface"""
-        try:
-            # Try multiple URL patterns
-            urls_to_try = [
-                f"https://old.reddit.com/r/{subreddit_name}/about/moderators",
-                f"https://www.reddit.com/r/{subreddit_name}/about/moderators/",
-                f"https://old.reddit.com/r/{subreddit_name}/about/moderators/"
-            ]
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1'
-            }
-            
-            session = requests.Session()
-            session.headers.update(headers)
-            
-            for url in urls_to_try:
-                try:
-                    logging.info(f"Trying URL: {url}")
-                    response = session.get(url, timeout=15, allow_redirects=True)
-                    
-                    logging.info(f"Response status: {response.status_code}")
-                    
-                    if response.status_code == 404:
-                        continue  # Try next URL
-                    elif response.status_code == 403:
-                        continue  # Try next URL
-                    elif response.status_code != 200:
-                        continue  # Try next URL
-                    
-                    # Check if we got redirected to login or error page
-                    if 'reddit.com/login' in response.url or 'reddit.com/subreddits/search' in response.url:
-                        continue  # Try next URL
-                    
-                    content = response.text
-                    moderators = []
-                    
-                    # Method 1: Look for old Reddit moderator list
-                    if 'old.reddit.com' in url:
-                        # Parse old Reddit format
-                        soup = BeautifulSoup(content, 'html.parser')
-                        mod_elements = soup.find_all('a', class_='author')
-                        
-                        for mod_element in mod_elements:
-                            username = mod_element.get_text().strip()
-                            if username and len(username) > 0 and not username.startswith('['):
-                                moderators.append({
-                                    'username': username,
-                                    'is_active': True,
-                                    'permissions': ['unknown']
-                                })
-                    
-                    # Method 2: Look for JSON data in scripts
-                    if not moderators:
-                        import json
-                        import re
-                        
-                        # Find JSON data containing moderators
-                        json_patterns = [
-                            r'"moderators":\s*(\[.*?\])',
-                            r'"data":\s*{[^}]*"moderators":\s*(\[.*?\])',
-                            r'window\.__r\s*=\s*({.*?});'
-                        ]
-                        
-                        for pattern in json_patterns:
-                            matches = re.findall(pattern, content, re.DOTALL)
-                            for match in matches:
-                                try:
-                                    if match.startswith('['):
-                                        mod_data = json.loads(match)
-                                    else:
-                                        data = json.loads(match)
-                                        # Navigate through the JSON to find moderators
-                                        # This is a simplified approach
-                                        continue
-                                    
-                                    for mod in mod_data:
-                                        if isinstance(mod, dict) and 'name' in mod:
-                                            moderators.append({
-                                                'username': mod['name'],
-                                                'is_active': True,
-                                                'permissions': ['unknown']
-                                            })
-                                        elif isinstance(mod, str):
-                                            moderators.append({
-                                                'username': mod,
-                                                'is_active': True,
-                                                'permissions': ['unknown']
-                                            })
-                                            
-                                    break
-                                except:
-                                    continue
-                    
-                    # Method 3: Look for usernames in links
-                    if not moderators:
-                        soup = BeautifulSoup(content, 'html.parser')
-                        user_links = soup.find_all('a', href=re.compile(r'/u(?:ser)?/'))
-                        
-                        seen_users = set()
-                        for link in user_links:
-                            href = link.get('href', '')
-                            username_match = re.search(r'/u(?:ser)?/([^/?]+)', href)
-                            if username_match:
-                                username = username_match.group(1)
-                                if (username and len(username) > 2 and 
-                                    username not in seen_users and
-                                    not username.startswith('t3_') and
-                                    username.isalnum() or '_' in username):
-                                    
-                                    seen_users.add(username)
-                                    moderators.append({
-                                        'username': username,
-                                        'is_active': True,
-                                        'permissions': ['unknown']
-                                    })
-                                    
-                                    if len(moderators) >= 20:  # Reasonable limit
-                                        break
-                    
-                    # If we found moderators, return them
-                    if moderators:
-                        # Remove duplicates
-                        seen = set()
-                        unique_mods = []
-                        for mod in moderators:
-                            if mod['username'] not in seen:
-                                seen.add(mod['username'])
-                                unique_mods.append(mod)
-                        
-                        logging.info(f"Found {len(unique_mods)} moderators using web scraping")
-                        
-                        return {
-                            'success': True,
-                            'subreddit': subreddit_name,
-                            'moderators': unique_mods[:15],  # Limit to 15
-                            'moderator_count': len(unique_mods),
-                            'active_moderators': len(unique_mods),
-                            'method': 'web_scraping',
-                            'analyzed_at': datetime.utcnow().isoformat()
-                        }
-                    
-                except requests.RequestException as e:
-                    logging.warning(f"Request failed for {url}: {e}")
-                    continue
-                except Exception as e:
-                    logging.warning(f"Parsing failed for {url}: {e}")
-                    continue
-            
-            # If all methods failed
-            return {
-                'success': False,
-                'error': f'Could not access moderator information for r/{subreddit_name}. Reddit may be blocking automated access.',
-                'error_type': 'scraping_blocked'
-            }
-            
-        except Exception as e:
-            logging.error(f"Web scraping completely failed for {subreddit_name}: {e}")
-            return {
-                'success': False,
-                'error': f'Web scraping failed: {str(e)}',
-                'error_type': 'scraping_error'
-            }
-
-    def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
-        """Get moderators of a subreddit with API + web scraping fallback"""
-        try:
-            # First try the Reddit API
-            logging.info(f"Attempting Reddit API for r/{subreddit_name} moderators")
-            
-            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
-            
-            # Verify subreddit exists
-            try:
-                _ = subreddit.subscribers
-            except Exception as e:
-                if "404" in str(e) or "not found" in str(e).lower():
-                    return {'success': False, 'error': f'Subreddit r/{subreddit_name} not found'}
-                elif "403" in str(e) or "private" in str(e).lower():
-                    return {'success': False, 'error': f'Subreddit r/{subreddit_name} is private'}
-            
-            moderators = []
-            
-            try:
-                # Try Reddit API first
-                for moderator in subreddit.moderator():
-                    moderators.append({
-                        'username': moderator.name,
-                        'is_active': True,
-                        'permissions': list(getattr(moderator, 'mod_permissions', ['unknown']))
-                    })
-                
-                if moderators:
-                    logging.info(f"Reddit API success: Found {len(moderators)} moderators")
-                    method = 'reddit_api'
-                else:
-                    raise Exception("Empty moderator list from API")
-                    
-            except Exception as api_error:
-                logging.warning(f"Reddit API failed for r/{subreddit_name}: {api_error}")
-                
-                # Fallback to web scraping
-                logging.info(f"Falling back to web scraping for r/{subreddit_name}")
-                scrape_result = self.scrape_moderators_fallback(subreddit_name)
-                
-                if not scrape_result['success']:
-                    return scrape_result
-                
-                moderators = scrape_result['moderators']
-                method = 'web_scraping'
-            
-            # Check for shared moderators
-            shared_mods = []
-            if self.airtable:
-                shared_mods = self.find_shared_moderators(subreddit_name, [m['username'] for m in moderators])
-            
-            # Save to Airtable
-            if self.airtable and moderators:
-                self.save_moderators_to_airtable(subreddit_name, moderators)
-            
-            return {
-                'success': True,
-                'subreddit': subreddit_name,
-                'moderators': moderators,
-                'moderator_count': len(moderators),
-                'active_moderators': len([m for m in moderators if m['is_active']]),
-                'shared_moderators': shared_mods,
-                'method': method,
-                'analyzed_at': datetime.utcnow().isoformat()
-            }
-            
-        except Exception as e:
-            logging.error(f"Error getting moderators for {subreddit_name}: {e}")
-            return {'success': False, 'error': str(e)}
-
-    def find_shared_moderators(self, current_subreddit: str, current_mods: List[str]) -> List[Dict[str, Any]]:
-        """Find moderators shared with other analyzed subreddits"""
-        if not self.airtable:
-            return []
-        
-        try:
-            # Get all stored moderators from other subreddits
-            all_mods = self.mods_table.all(formula=f"{{Subreddit}}!='{current_subreddit}'")
-            
-            shared = []
-            subreddit_mod_map = {}
-            
-            # Group mods by subreddit
-            for record in all_mods:
-                fields = record['fields']
-                subreddit = fields.get('Subreddit', '')
-                mod_name = fields.get('Moderator_Username', '')
-                
-                if subreddit not in subreddit_mod_map:
-                    subreddit_mod_map[subreddit] = []
-                subreddit_mod_map[subreddit].append(mod_name)
-            
-            # Find shared moderators
-            for subreddit, mods in subreddit_mod_map.items():
-                shared_mod_names = [mod for mod in current_mods if mod in mods]
-                
-                if shared_mod_names:
-                    shared.append({
-                        'subreddit': subreddit,
-                        'shared_mods': shared_mod_names,
-                        'shared_count': len(shared_mod_names)
-                    })
-            
-            # Sort by number of shared mods (highest first)
-            shared.sort(key=lambda x: x['shared_count'], reverse=True)
-            
-            return shared
-            
-        except Exception as e:
-            logging.error(f"Error finding shared moderators: {e}")
-            return []
-
-    def save_moderators_to_airtable(self, subreddit_name: str, moderators: List[Dict]) -> bool:
-        """Save moderators to Airtable"""
-        if not self.airtable:
-            return False
-        
-        try:
-            # Delete existing records for this subreddit
-            existing = self.mods_table.all(formula=f"{{Subreddit}}='{subreddit_name}'")
-            for record in existing:
-                self.mods_table.delete(record['id'])
-            
-            # Insert new moderator records
-            current_date = datetime.utcnow().strftime('%Y-%m-%d')
-            
-            for mod in moderators:
-                record_data = {
-                    'Subreddit': subreddit_name,
-                    'Moderator_Username': mod['username'],
-                    'Is_Active': mod['is_active'],
-                    'Permissions': ', '.join(mod['permissions']),
-                    'Last_Updated': current_date
-                }
-                
-                self.mods_table.create(record_data)
-            
-            logging.info(f"Saved {len(moderators)} moderators for r/{subreddit_name} to Airtable")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Failed to save moderators to Airtable: {e}")
-            return False
     
     def parse_compare_input(self, input_text: str) -> List[str]:
         """Parse flexible compare input formats"""
         cleaned = re.sub(r'\s+', ' ', input_text.strip())
         subreddits = re.split(r'[,\s]+', cleaned)
         return [sub.strip() for sub in subreddits if sub.strip()]
-
+    
     async def analyze_multiple_concurrent(self, subreddits: list, days: int = 7):
         """Analyze multiple subreddits concurrently"""
         loop = asyncio.get_event_loop()
@@ -1929,8 +1589,6 @@ class RedditAnalyzer:
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if not isinstance(r, Exception)]
-    
-    
 
 # Initialize analyzer
 analyzer = RedditAnalyzer()
@@ -2457,27 +2115,6 @@ def get_subreddit_rules():
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/mods', methods=['POST'])
-def get_mods_endpoint():
-    """Get subreddit moderators and check for shared mods with analyzed subreddits"""
-    data = request.json
-    subreddit_name = data.get('subreddit')
-    
-    if not subreddit_name:
-        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
-    
-    # Validate subreddit exists
-    validation = validate_subreddit(subreddit_name)
-    if not validation['valid']:
-        return jsonify({
-            'success': False,
-            'error': validation['message'],
-            'error_type': validation['error']
-        }), 400
-    
-    result = analyzer.get_subreddit_moderators(subreddit_name)
-    return jsonify(result)
 
 @app.route('/flairs', methods=['POST'])
 def analyze_flairs():
