@@ -1606,76 +1606,119 @@ class RedditAnalyzer:
             return {'success': False, 'error': str(e)}
     
 
-    # Add this method to your RedditAnalyzer class:
 
     def discover_subreddits_from_seed(self, seed_subreddit: str, 
-                                    max_users: int = 10, 
-                                    max_subreddits_per_user: int = 10) -> Dict[str, Any]:
+                                max_users: int = 20,  # Increased default
+                                max_subreddits_per_user: int = 10,
+                                full_analysis: bool = True) -> Dict[str, Any]:  # Added full_analysis flag
         """
-        4-step discovery process:
-        1. Get recent posters from seed subreddit
-        2. Find where those users post
-        3. Tag subreddits as NSFW/SFW
-        4. Analyze and save statistics
+        Enhanced 4-step discovery process with user selection info
         """
         try:
             results = {
                 'seed_subreddit': seed_subreddit,
                 'users_analyzed': [],
+                'user_selection_method': '',  # NEW: Track how users were selected
                 'discovered_subreddits': [],
                 'stats_collected': [],
                 'errors': []
             }
             
-            # Step 1: Get recent posters from seed subreddit
-            logging.info(f"Step 1: Getting recent posters from r/{seed_subreddit}")
+            # Step 1: Get DIVERSE users (AUTHORS + TOP COMMENTERS)
+            logging.info(f"Step 1: Getting diverse users from r/{seed_subreddit}")
             subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(seed_subreddit))
             
-            users_to_analyze = set()
+            users_to_analyze = {}  # Use dict to track user type and score
             
-            # Get users from recent hot posts
-            for post in subreddit.hot(limit=25):
+            # Get users from HOT posts (most active currently)
+            for post in subreddit.hot(limit=50):  # Increased from 25
                 try:
+                    # Track AUTHORS with their post scores
                     if post.author and post.author.name not in users_to_analyze:
-                        users_to_analyze.add(post.author.name)
-                        
-                    # Also get top commenters
-                    post.comments.replace_more(limit=0)
-                    for comment in post.comments[:3]:
-                        if comment.author and comment.author.name not in users_to_analyze:
-                            users_to_analyze.add(comment.author.name)
+                        users_to_analyze[post.author.name] = {
+                            'type': 'author',
+                            'score': post.score,
+                            'source': 'hot_post'
+                        }
                     
-                    if len(users_to_analyze) >= max_users:
+                    # Get TOP COMMENTERS (engaged users)
+                    post.comments.replace_more(limit=0)
+                    for comment in post.comments[:10]:  # Top 10 comments per post
+                        if comment.author and comment.author.name not in users_to_analyze:
+                            users_to_analyze[comment.author.name] = {
+                                'type': 'commenter',
+                                'score': comment.score,
+                                'source': 'hot_comment'
+                            }
+                    
+                    if len(users_to_analyze) >= max_users * 2:  # Get extra to filter
                         break
                         
                 except Exception as e:
                     logging.warning(f"Error processing post: {e}")
                     continue
             
-            users_list = list(users_to_analyze)[:max_users]
-            results['users_analyzed'] = users_list
-            logging.info(f"Found {len(users_list)} users to analyze")
+            # Also get users from TOP posts (high performers)
+            for post in subreddit.top(time_filter='week', limit=25):
+                try:
+                    if post.author and post.author.name not in users_to_analyze:
+                        users_to_analyze[post.author.name] = {
+                            'type': 'author',
+                            'score': post.score,
+                            'source': 'top_post'
+                        }
+                        
+                    if len(users_to_analyze) >= max_users * 3:
+                        break
+                        
+                except Exception as e:
+                    continue
             
-            # Step 2: Find where these users post
-            logging.info("Step 2: Finding where users post")
+            # Sort users by score and get diverse mix
+            sorted_users = sorted(users_to_analyze.items(), key=lambda x: x[1]['score'], reverse=True)
+            
+            # Select diverse user mix: top authors AND active commenters
+            selected_users = []
+            authors_selected = 0
+            commenters_selected = 0
+            
+            for username, data in sorted_users:
+                if data['type'] == 'author' and authors_selected < max_users * 0.6:  # 60% authors
+                    selected_users.append(username)
+                    authors_selected += 1
+                elif data['type'] == 'commenter' and commenters_selected < max_users * 0.4:  # 40% commenters
+                    selected_users.append(username)
+                    commenters_selected += 1
+                
+                if len(selected_users) >= max_users:
+                    break
+            
+            results['users_analyzed'] = selected_users
+            results['user_selection_method'] = f"Selected {authors_selected} post authors and {commenters_selected} top commenters from hot/top posts"
+            logging.info(f"Selected {len(selected_users)} diverse users")
+            
+            # Step 2: Find where these users post (with more thorough analysis)
+            logging.info("Step 2: Deep analysis of user activity")
             discovered_subs = defaultdict(lambda: {
-                'count': 0, 
+                'count': 0,
                 'users': set(),
                 'normalized_name': '',
-                'display_name': ''
+                'display_name': '',
+                'post_scores': [],  # Track actual post scores for quality assessment
+                'comment_scores': []
             })
             
-            for username in users_list:
+            for i, username in enumerate(selected_users):
                 try:
                     user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(username))
                     subs_found = 0
                     
-                    # Check user's recent submissions
-                    for submission in user.submissions.new(limit=25):
+                    # Analyze MORE posts per user (50 instead of 25)
+                    for submission in user.submissions.new(limit=50):
                         sub_display = submission.subreddit.display_name
                         sub_normalized = self.normalize_subreddit_name(sub_display)
                         
-                        # Skip seed subreddit and generic ones
+                        # Skip seed and generic
                         if sub_normalized == self.normalize_subreddit_name(seed_subreddit):
                             continue
                         if sub_normalized in self.generic_subreddits:
@@ -1685,44 +1728,69 @@ class RedditAnalyzer:
                         discovered_subs[sub_normalized]['users'].add(username)
                         discovered_subs[sub_normalized]['normalized_name'] = sub_normalized
                         discovered_subs[sub_normalized]['display_name'] = sub_display
+                        discovered_subs[sub_normalized]['post_scores'].append(submission.score)
                         
                         subs_found += 1
                         if subs_found >= max_subreddits_per_user:
                             break
                     
-                    time.sleep(0.5)  # Rate limiting
+                    # Also check comments for engagement
+                    for comment in user.comments.new(limit=100):
+                        sub_display = comment.subreddit.display_name
+                        sub_normalized = self.normalize_subreddit_name(sub_display)
+                        
+                        if sub_normalized != self.normalize_subreddit_name(seed_subreddit) and sub_normalized not in self.generic_subreddits:
+                            discovered_subs[sub_normalized]['users'].add(username)
+                            discovered_subs[sub_normalized]['comment_scores'].append(comment.score)
+                    
+                    # Progress logging
+                    if (i + 1) % 5 == 0:
+                        logging.info(f"Analyzed {i + 1}/{len(selected_users)} users")
+                    
+                    time.sleep(0.3)  # Rate limiting
                     
                 except Exception as e:
                     logging.warning(f"Error analyzing user {username}: {e}")
                     results['errors'].append(f"User {username}: {str(e)}")
                     continue
             
-            # Step 3: Tag subreddits as NSFW/SFW
-            logging.info("Step 3: Tagging subreddits")
+            # Step 3: Enhanced tagging with quality assessment
+            logging.info("Step 3: Enhanced tagging and quality assessment")
             for sub_normalized, sub_data in discovered_subs.items():
                 try:
                     is_nsfw = self.detect_nsfw_subreddit(sub_data['display_name'])
                     sub_data['is_nsfw'] = is_nsfw
                     sub_data['tag'] = 'NSFW' if is_nsfw else 'SFW'
                     
+                    # Calculate average engagement from discovered posts
+                    if sub_data['post_scores']:
+                        sub_data['avg_discovered_score'] = sum(sub_data['post_scores']) / len(sub_data['post_scores'])
+                    else:
+                        sub_data['avg_discovered_score'] = 0
+                        
                 except Exception as e:
                     logging.warning(f"Error tagging {sub_data['display_name']}: {e}")
                     sub_data['is_nsfw'] = False
                     sub_data['tag'] = 'Unknown'
             
-            # Sort by popularity
+            # Sort by user overlap AND engagement
             sorted_subs = sorted(
-                discovered_subs.items(), 
-                key=lambda x: len(x[1]['users']), 
+                discovered_subs.items(),
+                key=lambda x: (len(x[1]['users']) * 2 + x[1].get('avg_discovered_score', 0) / 10),
                 reverse=True
-            )[:20]  # Top 20
+            )[:30]  # Get top 30 for analysis
             
-            # Step 4: Collect statistics
-            logging.info("Step 4: Collecting statistics")
-            for sub_normalized, sub_data in sorted_subs:
+            # Step 4: FULL analysis if requested
+            logging.info(f"Step 4: {'Full' if full_analysis else 'Quick'} analysis of discovered subreddits")
+            
+            for sub_normalized, sub_data in sorted_subs[:20]:  # Analyze top 20
                 try:
-                    # Quick analysis (faster)
-                    analysis = self.analyze_subreddit_enhanced(sub_data['display_name'], days=7)
+                    if full_analysis:
+                        # FULL ANALYSIS with timing
+                        analysis = self.analyze_subreddit_with_timing(sub_data['display_name'], days=7)
+                    else:
+                        # Quick analysis
+                        analysis = self.analyze_subreddit_enhanced(sub_data['display_name'], days=7)
                     
                     if analysis.get('success'):
                         record_data = {
@@ -1735,18 +1803,23 @@ class RedditAnalyzer:
                             'effectiveness_score': analysis.get('effectiveness_score', 0),
                             'subscribers': analysis.get('subscribers', 0),
                             'median_score': analysis.get('median_score_per_post', 0),
-                            'avg_comments': analysis.get('avg_comments_per_post', 0)
+                            'avg_comments': analysis.get('avg_comments_per_post', 0),
+                            'avg_posts_per_day': analysis.get('avg_posts_per_day', 0),
+                            'consistency_score': analysis.get('consistency_analysis', {}).get('consistency_score', 0),
+                            'top_post': analysis.get('top_post', {}),
+                            'posting_times': analysis.get('posting_times', {}) if full_analysis else {},
+                            'avg_discovered_score': sub_data.get('avg_discovered_score', 0)
                         }
                         
                         results['discovered_subreddits'].append(record_data)
                         
-                        # Save to Airtable with deduplication
+                        # Save to Airtable
                         if self.airtable:
                             self.save_discovered_to_airtable(record_data)
                         
                         results['stats_collected'].append(sub_data['display_name'])
                         
-                    time.sleep(1)  # Rate limiting
+                    time.sleep(1.5)  # Rate limiting between analyses
                     
                 except Exception as e:
                     logging.warning(f"Error analyzing {sub_data['display_name']}: {e}")
@@ -1760,7 +1833,8 @@ class RedditAnalyzer:
                     'nsfw_count': sum(1 for s in results['discovered_subreddits'] if s['is_nsfw']),
                     'sfw_count': sum(1 for s in results['discovered_subreddits'] if not s['is_nsfw']),
                     'stats_collected': len(results['stats_collected']),
-                    'errors': len(results['errors'])
+                    'errors': len(results['errors']),
+                    'user_selection': results['user_selection_method']
                 },
                 'details': results
             }
@@ -2495,11 +2569,12 @@ def analyze_flairs():
 
 @app.route('/discover', methods=['POST'])
 def discover_endpoint():
-    """Discover related subreddits through user analysis"""
+    """Enhanced discovery endpoint"""
     data = request.json
     seed_subreddit = data.get('subreddit')
-    max_users = min(data.get('max_users', 10), 20)
-    max_subreddits = min(data.get('max_subreddits', 10), 15)
+    max_users = min(data.get('max_users', 20), 50)  # Default 20, max 50
+    max_subreddits = min(data.get('max_subreddits', 10), 20)  # Default 10, max 20
+    full_analysis = data.get('full_analysis', True)
     
     if not seed_subreddit:
         return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
@@ -2515,10 +2590,11 @@ def discover_endpoint():
     result = analyzer.discover_subreddits_from_seed(
         seed_subreddit, 
         max_users, 
-        max_subreddits
+        max_subreddits,
+        full_analysis
     )
     
-    return jsonify(result)        
+    return jsonify(result)       
 
 # Helper method to clean up old cache entries periodically
 def cleanup_cache():
