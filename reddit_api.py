@@ -53,8 +53,8 @@ class RedditAnalyzer:
         self.request_count = 0
         self.last_reset = time.time()
         # Less aggressive connection management
-        self.max_connection_age = 600  # 10 minutes instead of 5
-        self.max_idle_time = 300       # 5 minutes instead of 1
+        self.max_connection_age = 1800  # 10 minutes instead of 5
+        self.max_idle_time = 600       # 5 minutes instead of 1
         
         # Add request semaphore to limit concurrent requests
         self.request_semaphore = Semaphore(5)  # Max 5 concurrent Reddit requests
@@ -648,11 +648,13 @@ class RedditAnalyzer:
     def get_existing_record(self, subreddit_name: str):
         """Get existing record using case-insensitive search"""
         normalized = self.normalize_subreddit_name(subreddit_name)
-        # Use LOWER() function in Airtable formula for case-insensitive comparison
-        formula = f"LOWER({{Subreddit}})='{normalized}'"
         try:
-            existing = self.karma_table.all(formula=formula)
-            return existing[0] if existing else None
+            # Get ALL records and filter in Python instead
+            all_records = self.karma_table.all()
+            for record in all_records:
+                if record['fields'].get('Subreddit', '').lower() == normalized:
+                    return record
+            return None
         except Exception as e:
             logging.error(f"Error checking existing record: {e}")
             return None
