@@ -1605,6 +1605,208 @@ class RedditAnalyzer:
             logging.error(f"Error analyzing user {username}: {e}")
             return {'success': False, 'error': str(e)}
     
+
+    # Add this method to your RedditAnalyzer class:
+
+    def discover_subreddits_from_seed(self, seed_subreddit: str, 
+                                    max_users: int = 10, 
+                                    max_subreddits_per_user: int = 10) -> Dict[str, Any]:
+        """
+        4-step discovery process:
+        1. Get recent posters from seed subreddit
+        2. Find where those users post
+        3. Tag subreddits as NSFW/SFW
+        4. Analyze and save statistics
+        """
+        try:
+            results = {
+                'seed_subreddit': seed_subreddit,
+                'users_analyzed': [],
+                'discovered_subreddits': [],
+                'stats_collected': [],
+                'errors': []
+            }
+            
+            # Step 1: Get recent posters from seed subreddit
+            logging.info(f"Step 1: Getting recent posters from r/{seed_subreddit}")
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(seed_subreddit))
+            
+            users_to_analyze = set()
+            
+            # Get users from recent hot posts
+            for post in subreddit.hot(limit=25):
+                try:
+                    if post.author and post.author.name not in users_to_analyze:
+                        users_to_analyze.add(post.author.name)
+                        
+                    # Also get top commenters
+                    post.comments.replace_more(limit=0)
+                    for comment in post.comments[:3]:
+                        if comment.author and comment.author.name not in users_to_analyze:
+                            users_to_analyze.add(comment.author.name)
+                    
+                    if len(users_to_analyze) >= max_users:
+                        break
+                        
+                except Exception as e:
+                    logging.warning(f"Error processing post: {e}")
+                    continue
+            
+            users_list = list(users_to_analyze)[:max_users]
+            results['users_analyzed'] = users_list
+            logging.info(f"Found {len(users_list)} users to analyze")
+            
+            # Step 2: Find where these users post
+            logging.info("Step 2: Finding where users post")
+            discovered_subs = defaultdict(lambda: {
+                'count': 0, 
+                'users': set(),
+                'normalized_name': '',
+                'display_name': ''
+            })
+            
+            for username in users_list:
+                try:
+                    user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(username))
+                    subs_found = 0
+                    
+                    # Check user's recent submissions
+                    for submission in user.submissions.new(limit=25):
+                        sub_display = submission.subreddit.display_name
+                        sub_normalized = self.normalize_subreddit_name(sub_display)
+                        
+                        # Skip seed subreddit and generic ones
+                        if sub_normalized == self.normalize_subreddit_name(seed_subreddit):
+                            continue
+                        if sub_normalized in self.generic_subreddits:
+                            continue
+                        
+                        discovered_subs[sub_normalized]['count'] += 1
+                        discovered_subs[sub_normalized]['users'].add(username)
+                        discovered_subs[sub_normalized]['normalized_name'] = sub_normalized
+                        discovered_subs[sub_normalized]['display_name'] = sub_display
+                        
+                        subs_found += 1
+                        if subs_found >= max_subreddits_per_user:
+                            break
+                    
+                    time.sleep(0.5)  # Rate limiting
+                    
+                except Exception as e:
+                    logging.warning(f"Error analyzing user {username}: {e}")
+                    results['errors'].append(f"User {username}: {str(e)}")
+                    continue
+            
+            # Step 3: Tag subreddits as NSFW/SFW
+            logging.info("Step 3: Tagging subreddits")
+            for sub_normalized, sub_data in discovered_subs.items():
+                try:
+                    is_nsfw = self.detect_nsfw_subreddit(sub_data['display_name'])
+                    sub_data['is_nsfw'] = is_nsfw
+                    sub_data['tag'] = 'NSFW' if is_nsfw else 'SFW'
+                    
+                except Exception as e:
+                    logging.warning(f"Error tagging {sub_data['display_name']}: {e}")
+                    sub_data['is_nsfw'] = False
+                    sub_data['tag'] = 'Unknown'
+            
+            # Sort by popularity
+            sorted_subs = sorted(
+                discovered_subs.items(), 
+                key=lambda x: len(x[1]['users']), 
+                reverse=True
+            )[:20]  # Top 20
+            
+            # Step 4: Collect statistics
+            logging.info("Step 4: Collecting statistics")
+            for sub_normalized, sub_data in sorted_subs:
+                try:
+                    # Quick analysis (faster)
+                    analysis = self.analyze_subreddit_enhanced(sub_data['display_name'], days=7)
+                    
+                    if analysis.get('success'):
+                        record_data = {
+                            'normalized_name': sub_normalized,
+                            'display_name': sub_data['display_name'],
+                            'is_nsfw': sub_data['is_nsfw'],
+                            'tag': sub_data['tag'],
+                            'discovered_from': seed_subreddit,
+                            'user_overlap_count': len(sub_data['users']),
+                            'effectiveness_score': analysis.get('effectiveness_score', 0),
+                            'subscribers': analysis.get('subscribers', 0),
+                            'median_score': analysis.get('median_score_per_post', 0),
+                            'avg_comments': analysis.get('avg_comments_per_post', 0)
+                        }
+                        
+                        results['discovered_subreddits'].append(record_data)
+                        
+                        # Save to Airtable with deduplication
+                        if self.airtable:
+                            self.save_discovered_to_airtable(record_data)
+                        
+                        results['stats_collected'].append(sub_data['display_name'])
+                        
+                    time.sleep(1)  # Rate limiting
+                    
+                except Exception as e:
+                    logging.warning(f"Error analyzing {sub_data['display_name']}: {e}")
+                    results['errors'].append(f"Stats for {sub_data['display_name']}: {str(e)}")
+            
+            return {
+                'success': True,
+                'summary': {
+                    'users_analyzed': len(results['users_analyzed']),
+                    'subreddits_discovered': len(results['discovered_subreddits']),
+                    'nsfw_count': sum(1 for s in results['discovered_subreddits'] if s['is_nsfw']),
+                    'sfw_count': sum(1 for s in results['discovered_subreddits'] if not s['is_nsfw']),
+                    'stats_collected': len(results['stats_collected']),
+                    'errors': len(results['errors'])
+                },
+                'details': results
+            }
+            
+        except Exception as e:
+            logging.error(f"Error in discovery process: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def save_discovered_to_airtable(self, discovery_data: Dict[str, Any]) -> bool:
+        """Save discovered subreddit to Airtable"""
+        if not self.airtable:
+            return False
+            
+        try:
+            normalized_name = discovery_data['normalized_name']
+            
+            # Check if already exists (using Python filtering)
+            existing_record = self.get_existing_record(normalized_name)
+            
+            record_data = {
+                'Subreddit': normalized_name,
+                'Display_Name': discovery_data['display_name'],
+                'Is_NSFW': discovery_data['is_nsfw'],
+                'Tag': discovery_data.get('tag', 'Unknown'),
+                'Discovered_From': discovery_data.get('discovered_from', ''),
+                'User_Overlap_Count': discovery_data.get('user_overlap_count', 0),
+                'Effectiveness_Score': discovery_data.get('effectiveness_score', 0),
+                'Subscribers': discovery_data.get('subscribers', 0),
+                'Median_Score_Per_Post': discovery_data.get('median_score', 0),
+                'Avg_Comments_Per_Post': discovery_data.get('avg_comments', 0),
+                'Discovery_Date': datetime.utcnow().strftime('%Y-%m-%d')
+            }
+            
+            if existing_record:
+                self.karma_table.update(existing_record['id'], record_data)
+                logging.info(f"Updated discovered subreddit: {normalized_name}")
+            else:
+                self.karma_table.create(record_data)
+                logging.info(f"Created new discovered subreddit: {normalized_name}")
+                
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to save discovered subreddit: {e}")
+            return False
+
     def parse_compare_input(self, input_text: str) -> List[str]:
         """Parse flexible compare input formats"""
         cleaned = re.sub(r'\s+', ' ', input_text.strip())
@@ -2289,6 +2491,34 @@ def analyze_flairs():
                 'success': False,
                 'error': f'Analysis failed: {error_message}'
             }), 500
+        
+
+@app.route('/discover', methods=['POST'])
+def discover_endpoint():
+    """Discover related subreddits through user analysis"""
+    data = request.json
+    seed_subreddit = data.get('subreddit')
+    max_users = min(data.get('max_users', 10), 20)
+    max_subreddits = min(data.get('max_subreddits', 10), 15)
+    
+    if not seed_subreddit:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    validation = validate_subreddit(seed_subreddit)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    result = analyzer.discover_subreddits_from_seed(
+        seed_subreddit, 
+        max_users, 
+        max_subreddits
+    )
+    
+    return jsonify(result)        
 
 # Helper method to clean up old cache entries periodically
 def cleanup_cache():
