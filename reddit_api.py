@@ -1811,82 +1811,89 @@ class RedditAnalyzer:
                 reverse=True
             )[:100]  # Increased from 30 to 100!
             
-            # Step 4: Analysis - analyze MORE subreddits
-            logging.info(f"Step 4: {'Full' if full_analysis else 'Quick'} analysis of top {min(50, len(sorted_subs))} subreddits")
+            # Step 4: FULL analysis for ALL discovered subreddits
+            if analyze_all:
+                logging.info(f"Step 4: Full analysis of ALL {len(sorted_subs)} discovered subreddits")
+                analysis_limit = len(sorted_subs)  # Analyze ALL, not just top 50
+            else:
+                logging.info(f"Step 4: Analysis of top 50 subreddits")
+                analysis_limit = 50
             
-            analysis_limit = 50  # Increased from 20 to 50
-            for idx, (sub_normalized, sub_data) in enumerate(sorted_subs[:analysis_limit]):
-                try:
-                    # Skip user profiles
-                    if sub_data['display_name'].startswith('u_'):
-                        continue
-                    
-                    logging.info(f"Analyzing {idx+1}/{min(analysis_limit, len(sorted_subs))}: {sub_data['display_name']}")
-                    
-                    if full_analysis:
-                        analysis = self.analyze_subreddit_with_timing(sub_data['display_name'], days=7)
-                    else:
-                        analysis = self.analyze_subreddit_enhanced(sub_data['display_name'], days=7)
-                    
-                    if analysis.get('success'):
-                        record_data = {
-                            'normalized_name': sub_normalized,
-                            'display_name': sub_data['display_name'],
-                            'is_nsfw': sub_data['is_nsfw'],
-                            'tag': sub_data['tag'],
-                            'discovered_from': seed_subreddit,
-                            'user_overlap_count': len(sub_data['users']),
-                            'effectiveness_score': analysis.get('effectiveness_score', 0),
-                            'subscribers': analysis.get('subscribers', 0),
-                            'median_score': analysis.get('median_score_per_post', 0),
-                            'avg_comments': analysis.get('avg_comments_per_post', 0),
-                            'avg_posts_per_day': analysis.get('avg_posts_per_day', 0),
-                            'consistency_score': analysis.get('consistency_analysis', {}).get('consistency_score', 0),
-                            'top_post': analysis.get('top_post', {}),
-                            'posting_times': analysis.get('posting_times', {}) if full_analysis else {},
-                            'avg_discovered_score': sub_data.get('avg_discovered_score', 0)
-                        }
-                        
-                        results['discovered_subreddits'].append(record_data)
-                        
-                        if self.airtable:
-                            self.save_discovered_to_airtable(record_data)
-                        
-                        results['stats_collected'].append(sub_data['display_name'])
-                    else:
-                        logging.warning(f"Failed to analyze {sub_data['display_name']}: {analysis.get('error', 'Unknown error')}")
-                        
-                    time.sleep(1)  # Reduced from 1.5 for faster processing
-                    
-                except Exception as e:
-                    logging.warning(f"Error analyzing {sub_data.get('display_name', 'unknown')}: {e}")
-                    results['errors'].append(f"Stats for {sub_data.get('display_name', 'unknown')}: {str(e)}")
+            # Process in batches for better performance
+            batch_size = 5  # Process 5 at a time
+            analyzed_count = 0
             
-            # Also include basic info for subs we couldn't fully analyze
-            for sub_normalized, sub_data in sorted_subs[analysis_limit:min(100, len(sorted_subs))]:
-                try:
-                    if sub_data['display_name'].startswith('u_'):
-                        continue
+            for batch_start in range(0, min(analysis_limit, len(sorted_subs)), batch_size):
+                batch_end = min(batch_start + batch_size, len(sorted_subs))
+                batch_subs = sorted_subs[batch_start:batch_end]
+                
+                # Process batch concurrently using thread pool
+                batch_results = []
+                
+                for sub_normalized, sub_data in batch_subs:
+                    try:
+                        # Skip user profiles
+                        if sub_data['display_name'].startswith('u_'):
+                            continue
                         
-                    results['discovered_subreddits'].append({
-                        'normalized_name': sub_normalized,
-                        'display_name': sub_data['display_name'],
-                        'is_nsfw': sub_data.get('is_nsfw', False),
-                        'tag': sub_data.get('tag', 'Unknown'),
-                        'discovered_from': seed_subreddit,
-                        'user_overlap_count': len(sub_data['users']),
-                        'avg_discovered_score': sub_data.get('avg_discovered_score', 0),
-                        'analyzed': False  # Mark as not fully analyzed
-                    })
-                except:
-                    continue
+                        analyzed_count += 1
+                        logging.info(f"Analyzing {analyzed_count}/{min(analysis_limit, len(sorted_subs))}: {sub_data['display_name']}")
+                        
+                        # Use quick analysis to save time when analyzing many subs
+                        if analyzed_count <= 20 and full_analysis:
+                            # Full analysis with timing for top 20
+                            analysis = self.analyze_subreddit_with_timing(sub_data['display_name'], days=7)
+                        else:
+                            # Quick analysis for the rest (faster)
+                            analysis = self.analyze_subreddit_enhanced(sub_data['display_name'], days=3)  # Only 3 days for speed
+                        
+                        if analysis.get('success'):
+                            record_data = {
+                                'normalized_name': sub_normalized,
+                                'display_name': sub_data['display_name'],
+                                'is_nsfw': sub_data['is_nsfw'],
+                                'tag': sub_data['tag'],
+                                'discovered_from': seed_subreddit,
+                                'user_overlap_count': len(sub_data['users']),
+                                'effectiveness_score': analysis.get('effectiveness_score', 0),
+                                'subscribers': analysis.get('subscribers', 0),
+                                'median_score': analysis.get('median_score_per_post', 0),
+                                'avg_comments': analysis.get('avg_comments_per_post', 0),
+                                'avg_posts_per_day': analysis.get('avg_posts_per_day', 0),
+                                'consistency_score': analysis.get('consistency_analysis', {}).get('consistency_score', 0),
+                                'top_post': analysis.get('top_post', {}),
+                                'posting_times': analysis.get('posting_times', {}) if analyzed_count <= 20 and full_analysis else {},
+                                'avg_discovered_score': sub_data.get('avg_discovered_score', 0),
+                                'analysis_depth': 'full' if analyzed_count <= 20 else 'quick'
+                            }
+                            
+                            results['discovered_subreddits'].append(record_data)
+                            
+                            if self.airtable:
+                                self.save_discovered_to_airtable(record_data)
+                            
+                            results['stats_collected'].append(sub_data['display_name'])
+                        else:
+                            logging.warning(f"Failed to analyze {sub_data['display_name']}: {analysis.get('error', 'Unknown error')}")
+                            
+                    except Exception as e:
+                        logging.warning(f"Error analyzing {sub_data.get('display_name', 'unknown')}: {e}")
+                        results['errors'].append(f"Stats for {sub_data.get('display_name', 'unknown')}: {str(e)}")
+                
+                # Rate limiting between batches
+                if batch_end < len(sorted_subs):
+                    time.sleep(0.5)  # Short pause between batches
             
             return {
                 'success': True,
                 'summary': {
                     'users_analyzed': len(results['users_analyzed']),
-                    'subreddits_discovered': len(results['discovered_subreddits']),
+                    'subreddits_discovered': len(sorted_subs),
                     'fully_analyzed': len(results['stats_collected']),
+                    'analysis_depth': {
+                        'full_with_timing': min(20, len(results['stats_collected'])),
+                        'quick_analysis': max(0, len(results['stats_collected']) - 20)
+                    },
                     'nsfw_count': sum(1 for s in results['discovered_subreddits'] if s.get('is_nsfw', False)),
                     'sfw_count': sum(1 for s in results['discovered_subreddits'] if not s.get('is_nsfw', False)),
                     'errors': len(results['errors']),
@@ -2625,12 +2632,13 @@ def analyze_flairs():
 
 @app.route('/discover', methods=['POST'])
 def discover_endpoint():
-    """Enhanced discovery endpoint"""
+    """Enhanced discovery endpoint with full analysis option"""
     data = request.json
     seed_subreddit = data.get('subreddit')
-    max_users = min(data.get('max_users', 20), 50)  # Default 20, max 50
-    max_subreddits = min(data.get('max_subreddits', 10), 20)  # Default 10, max 20
+    max_users = min(data.get('max_users', 20), 50)
+    max_subreddits = min(data.get('max_subreddits', 10), 20)
     full_analysis = data.get('full_analysis', True)
+    analyze_all = data.get('analyze_all', True)  # New parameter
     
     if not seed_subreddit:
         return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
@@ -2647,10 +2655,11 @@ def discover_endpoint():
         seed_subreddit, 
         max_users, 
         max_subreddits,
-        full_analysis
+        full_analysis,
+        analyze_all  # Pass the new parameter
     )
     
-    return jsonify(result)       
+    return jsonify(result)    
 
 # Helper method to clean up old cache entries periodically
 def cleanup_cache():
