@@ -1046,134 +1046,136 @@ class RedditAnalyzer:
                         logging.info(f"Cached data for {subreddit_name} is too old, analyzing fresh")
             except Exception as e:
                 logging.warning(f"Airtable cache read failed: {e}")
+
+
             
-            # Analyze if not cached or cache failed
-            try:
-                logging.info(f"Starting karma analysis for {subreddit_name} with {post_limit} posts")
-                subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
-                
-                min_post_karma = float('inf')
-                min_comment_karma = float('inf')
-                min_account_age = float('inf')
-                
-                users_analyzed = set()
-                
-                # Analyze recent posts and authors with configurable limit
-                for post in subreddit.new(limit=post_limit):
-                    try:
-                        if not post.author or post.author.name in users_analyzed:
-                            continue
-                        
-                        users_analyzed.add(post.author.name)
-                        user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(post.author.name))
-                        
-                        post_karma = getattr(user, 'link_karma', 0)
-                        comment_karma = getattr(user, 'comment_karma', 0)
-                        
-                        if post_karma < min_post_karma:
-                            min_post_karma = post_karma
-                        if comment_karma < min_comment_karma:
-                            min_comment_karma = comment_karma
-                            
-                        try:
-                            account_age = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
-                            if account_age < min_account_age:
-                                min_account_age = account_age
-                        except (AttributeError, OSError):
-                            pass
-                        
-                        if len(users_analyzed) % 10 == 0:
-                            time.sleep(0.3)
-                            
-                    except Exception as e:
-                        logging.warning(f"Error analyzing user: {e}")
+        # Analyze if not cached or cache failed
+        try:
+            logging.info(f"Starting karma analysis for {subreddit_name} with {post_limit} posts")
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            min_post_karma = float('inf')
+            min_comment_karma = float('inf')
+            min_account_age = float('inf')
+            
+            users_analyzed = set()
+            
+            # Analyze recent posts and authors with configurable limit
+            for post in subreddit.new(limit=post_limit):
+                try:
+                    if not post.author or post.author.name in users_analyzed:
                         continue
-                
-                logging.info(f"Analyzed {len(users_analyzed)} users from {post_limit} posts for {subreddit_name}")
-                
-                # Calculate requirements
-                post_karma_req = max(0, min_post_karma - 1) if min_post_karma != float('inf') else 0
-                comment_karma_req = max(0, min_comment_karma - 1) if min_comment_karma != float('inf') else 0
-                account_age_req = max(0, min_account_age - 1) if min_account_age != float('inf') else 0
-                
-                # Determine confidence
-                if post_karma_req > 100 or comment_karma_req > 100:
-                    confidence = 'High'
-                elif post_karma_req > 10 or comment_karma_req > 10:
-                    confidence = 'Medium'
-                else:
-                    confidence = 'Low'
-                
-                # Enhanced verification detection
-                verification_check = self.check_verification_requirements(subreddit_name)
-                
-                result = {
-                    'success': True,
-                    'from_cache': False,
-                    'post_karma_min': post_karma_req,
-                    'comment_karma_min': comment_karma_req,
-                    'account_age_days': account_age_req,
-                    'confidence': confidence,
-                    'requires_verification': verification_check['requires_verification'],
-                    'verification_method': verification_check['method'],
-                    'verification_confidence': verification_check['confidence'],
-                    'rules_based_verification': verification_check['rules_based'],
-                    'flair_based_verification': verification_check['flair_based'],
-                    'verification_optional': verification_check['verification_optional'],
-                    'verification_note': verification_check['verification_note'],
-                    'users_analyzed': len(users_analyzed),
-                    'posts_scraped': post_limit
-                }
-                
-                if self.airtable:
-                        try:
-                            normalized_name = self.normalize_subreddit_name(subreddit_name)
-                            display_name = subreddit_name
-                            existing_record = self.get_existing_record(subreddit_name)
-                            current_date = datetime.utcnow().strftime('%Y-%m-%d')
+                    
+                    users_analyzed.add(post.author.name)
+                    user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(post.author.name))
+                    
+                    post_karma = getattr(user, 'link_karma', 0)
+                    comment_karma = getattr(user, 'comment_karma', 0)
+                    
+                    if post_karma < min_post_karma:
+                        min_post_karma = post_karma
+                    if comment_karma < min_comment_karma:
+                        min_comment_karma = comment_karma
+                        
+                    try:
+                        account_age = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
+                        if account_age < min_account_age:
+                            min_account_age = account_age
+                    except (AttributeError, OSError):
+                        pass
+                    
+                    if len(users_analyzed) % 10 == 0:
+                        time.sleep(0.3)
+                        
+                except Exception as e:
+                    logging.warning(f"Error analyzing user: {e}")
+                    continue
+            
+            logging.info(f"Analyzed {len(users_analyzed)} users from {post_limit} posts for {subreddit_name}")
+            
+            # Calculate requirements
+            post_karma_req = max(0, min_post_karma - 1) if min_post_karma != float('inf') else 0
+            comment_karma_req = max(0, min_comment_karma - 1) if min_comment_karma != float('inf') else 0
+            account_age_req = max(0, min_account_age - 1) if min_account_age != float('inf') else 0
+            
+            # Determine confidence
+            if post_karma_req > 100 or comment_karma_req > 100:
+                confidence = 'High'
+            elif post_karma_req > 10 or comment_karma_req > 10:
+                confidence = 'Medium'
+            else:
+                confidence = 'Low'
+            
+            # Enhanced verification detection
+            verification_check = self.check_verification_requirements(subreddit_name)
+            
+            result = {
+                'success': True,
+                'from_cache': False,
+                'post_karma_min': post_karma_req,
+                'comment_karma_min': comment_karma_req,
+                'account_age_days': account_age_req,
+                'confidence': confidence,
+                'requires_verification': verification_check['requires_verification'],
+                'verification_method': verification_check['method'],
+                'verification_confidence': verification_check['confidence'],
+                'rules_based_verification': verification_check['rules_based'],
+                'flair_based_verification': verification_check['flair_based'],
+                'verification_optional': verification_check['verification_optional'],
+                'verification_note': verification_check['verification_note'],
+                'users_analyzed': len(users_analyzed),
+                'posts_scraped': post_limit
+            }
+            
+            if self.airtable:
+                    try:
+                        normalized_name = self.normalize_subreddit_name(subreddit_name)
+                        display_name = subreddit_name
+                        existing_record = self.get_existing_record(subreddit_name)
+                        current_date = datetime.utcnow().strftime('%Y-%m-%d')
+                        
+                        record_data = {
+                            'Subreddit': normalized_name,  # Normalized
+                            'Display_Name': display_name,   # Original
+                            'Post_Karma_Min': result['post_karma_min'],
+                            'Comment_Karma_Min': result['comment_karma_min'],
+                            'Account_Age_Days': result['account_age_days'],
+                            'Confidence': result['confidence'],
+                            'Requires_Verification': result['requires_verification'],
+                            'Verification_Method': result['verification_method'],
+                            'Verification_Optional': result['verification_optional'],
+                            'Verification_Note': result['verification_note'],
+                            'Last_Updated': current_date,
+                            'Posts_Analyzed': post_limit
+                        }
+                        
+                        if existing_record:
+                            # Preserve analyze data if it exists
+                            existing_fields = existing_record['fields']
+                            analyze_fields = [
+                                'Subscribers', 'Effectiveness_Score', 'Avg_Posts_Per_Day',
+                                'Avg_Score_Per_Post', 'Median_Score_Per_Post', 'Avg_Comments_Per_Post',
+                                'Is_NSFW', 'Last_Analyzed'
+                            ]
                             
-                            record_data = {
-                                'Subreddit': normalized_name,  # Normalized
-                                'Display_Name': display_name,   # Original
-                                'Post_Karma_Min': result['post_karma_min'],
-                                'Comment_Karma_Min': result['comment_karma_min'],
-                                'Account_Age_Days': result['account_age_days'],
-                                'Confidence': result['confidence'],
-                                'Requires_Verification': result['requires_verification'],
-                                'Verification_Method': result['verification_method'],
-                                'Verification_Optional': result['verification_optional'],
-                                'Verification_Note': result['verification_note'],
-                                'Last_Updated': current_date,
-                                'Posts_Analyzed': post_limit
-                            }
+                            for field in analyze_fields:
+                                if field in existing_fields and field not in record_data:
+                                    record_data[field] = existing_fields[field]
                             
-                            if existing_record:
-                                # Preserve analyze data if it exists
-                                existing_fields = existing_record['fields']
-                                analyze_fields = [
-                                    'Subscribers', 'Effectiveness_Score', 'Avg_Posts_Per_Day',
-                                    'Avg_Score_Per_Post', 'Median_Score_Per_Post', 'Avg_Comments_Per_Post',
-                                    'Is_NSFW', 'Last_Analyzed'
-                                ]
+                            updated = self.karma_table.update(existing_record['id'], record_data)
+                            logging.info(f"Updated karma requirements for {display_name}")
+                        else:
+                            created = self.karma_table.create(record_data)
+                            logging.info(f"Created karma requirements for {display_name}")
                                 
-                                for field in analyze_fields:
-                                    if field in existing_fields and field not in record_data:
-                                        record_data[field] = existing_fields[field]
-                                
-                                updated = self.karma_table.update(existing_record['id'], record_data)
-                                logging.info(f"Updated karma requirements for {display_name}")
-                            else:
-                                created = self.karma_table.create(record_data)
-                                logging.info(f"Created karma requirements for {display_name}")
-                                    
-                        except Exception as e:
-                            logging.error(f"Airtable save failed for {subreddit_name}: {e}")
-                
-                return result
-                
-            except Exception as e:
-                logging.error(f"Error in karma analysis for {subreddit_name}: {e}")
-                return {'success': False, 'error': str(e)}
+                    except Exception as e:
+                        logging.error(f"Airtable save failed for {subreddit_name}: {e}")
+            
+            return result
+            
+        except Exception as e:
+            logging.error(f"Error in karma analysis for {subreddit_name}: {e}")
+            return {'success': False, 'error': str(e)}
     
     def detect_fake_upvotes(self, subreddit_name: str) -> Dict[str, Any]:
         """Detect potential fake upvote patterns"""
