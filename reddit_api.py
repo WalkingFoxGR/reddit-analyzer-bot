@@ -16,7 +16,7 @@ from pyairtable import Api
 import statistics
 from contextlib import contextmanager
 from threading import Semaphore
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 
 app = Flask(__name__)
@@ -1139,6 +1139,8 @@ class RedditAnalyzer:
                         record_data = {
                             'Subreddit': normalized_name,  # Normalized
                             'Display_Name': display_name,   # Original
+                            'Requirements_Checked': True,  # Mark as checked
+                            'Requirements_Check_Date': current_date,
                             'Post_Karma_Min': result['post_karma_min'],
                             'Comment_Karma_Min': result['comment_karma_min'],
                             'Account_Age_Days': result['account_age_days'],
@@ -1812,41 +1814,53 @@ class RedditAnalyzer:
                 reverse=True
             )[:100]  # Increased from 30 to 100!
             
-            # Step 4: FULL analysis for ALL discovered subreddits
+            # Step 4: FULL analysis for ALL discovered subreddits with CONCURRENT processing
             if analyze_all:
-                logging.info(f"Step 4: Full analysis of ALL {len(sorted_subs)} discovered subreddits")
+                logging.info(f"Step 4: Concurrent analysis of ALL {len(sorted_subs)} discovered subreddits")
                 analysis_limit = len(sorted_subs)  # Analyze ALL, not just top 50
             else:
-                logging.info(f"Step 4: Analysis of top 50 subreddits")
+                logging.info(f"Step 4: Concurrent analysis of top 50 subreddits")
                 analysis_limit = 50
-            
-            # Process in batches for better performance
-            batch_size = 5  # Process 5 at a time
-            analyzed_count = 0
-            
-            for batch_start in range(0, min(analysis_limit, len(sorted_subs)), batch_size):
-                batch_end = min(batch_start + batch_size, len(sorted_subs))
-                batch_subs = sorted_subs[batch_start:batch_end]
+
+            # Process in TRULY concurrent batches
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = {}
+                analyzed_count = 0
                 
-                # Process batch concurrently using thread pool
-                batch_results = []
+                for sub_normalized, sub_data in sorted_subs[:analysis_limit]:
+                    if sub_data['display_name'].startswith('u_'):
+                        continue
+                        
+                    analyzed_count += 1
+                    
+                    # Submit analysis task
+                    if analyzed_count <= 20 and full_analysis:
+                        # Full analysis with timing for top 20
+                        future = executor.submit(
+                            self.analyze_subreddit_with_timing, 
+                            sub_data['display_name'], 
+                            7
+                        )
+                    else:
+                        # Quick analysis for the rest (faster)
+                        future = executor.submit(
+                            self.analyze_subreddit_enhanced,
+                            sub_data['display_name'],
+                            3
+                        )
+                    
+                    futures[future] = (sub_normalized, sub_data, analyzed_count)
                 
-                for sub_normalized, sub_data in batch_subs:
+                logging.info(f"Submitted {len(futures)} analysis tasks for concurrent processing")
+                
+                # Process completed futures as they complete
+                completed_count = 0
+                for future in as_completed(futures):
+                    sub_normalized, sub_data, task_number = futures[future]
+                    completed_count += 1
+                    
                     try:
-                        # Skip user profiles
-                        if sub_data['display_name'].startswith('u_'):
-                            continue
-                        
-                        analyzed_count += 1
-                        logging.info(f"Analyzing {analyzed_count}/{min(analysis_limit, len(sorted_subs))}: {sub_data['display_name']}")
-                        
-                        # Use quick analysis to save time when analyzing many subs
-                        if analyzed_count <= 20 and full_analysis:
-                            # Full analysis with timing for top 20
-                            analysis = self.analyze_subreddit_with_timing(sub_data['display_name'], days=7)
-                        else:
-                            # Quick analysis for the rest (faster)
-                            analysis = self.analyze_subreddit_enhanced(sub_data['display_name'], days=3)  # Only 3 days for speed
+                        analysis = future.result()
                         
                         if analysis.get('success'):
                             record_data = {
@@ -1863,42 +1877,42 @@ class RedditAnalyzer:
                                 'avg_posts_per_day': analysis.get('avg_posts_per_day', 0),
                                 'consistency_score': analysis.get('consistency_analysis', {}).get('consistency_score', 0),
                                 'top_post': analysis.get('top_post', {}),
-                                'posting_times': analysis.get('posting_times', {}) if analyzed_count <= 20 and full_analysis else {},
+                                'posting_times': analysis.get('posting_times', {}) if task_number <= 20 and full_analysis else {},
                                 'avg_discovered_score': sub_data.get('avg_discovered_score', 0),
-                                'analysis_depth': 'full' if analyzed_count <= 20 else 'quick'
+                                'analysis_depth': 'full' if task_number <= 20 else 'quick'
                             }
                             
                             results['discovered_subreddits'].append(record_data)
                             
+                            # Save to Airtable in background (non-blocking)
                             if self.airtable:
-                                self.save_discovered_to_airtable(record_data)
+                                try:
+                                    self.save_discovered_to_airtable(record_data)
+                                except Exception as e:
+                                    logging.warning(f"Failed to save {sub_data['display_name']} to Airtable: {e}")
                             
                             results['stats_collected'].append(sub_data['display_name'])
+                            
+                            # Log progress every 10 completed
+                            if completed_count % 10 == 0:
+                                logging.info(f"Completed {completed_count}/{len(futures)} concurrent analyses")
                         else:
                             logging.warning(f"Failed to analyze {sub_data['display_name']}: {analysis.get('error', 'Unknown error')}")
-                            
-                    except Exception as e:
-                        logging.warning(f"Error analyzing {sub_data.get('display_name', 'unknown')}: {e}")
-                        results['errors'].append(f"Stats for {sub_data.get('display_name', 'unknown')}: {str(e)}")
                 
-                # Rate limiting between batches
-                if batch_end < len(sorted_subs):
-                    time.sleep(0.5)  # Short pause between batches
+                    except Exception as e:
+                        logging.warning(f"Exception analyzing {sub_data.get('display_name', 'unknown')}: {e}")
+                        results['errors'].append(f"Stats for {sub_data.get('display_name', 'unknown')}: {str(e)}")
+
+            logging.info(f"Concurrent analysis complete: {len(results['stats_collected'])} subreddits analyzed")
             
+            # MISSING PART - Return the final results with summary
             return {
                 'success': True,
                 'summary': {
                     'users_analyzed': len(results['users_analyzed']),
                     'subreddits_discovered': len(sorted_subs),
-                    'fully_analyzed': len(results['stats_collected']),
-                    'analysis_depth': {
-                        'full_with_timing': min(20, len(results['stats_collected'])),
-                        'quick_analysis': max(0, len(results['stats_collected']) - 20)
-                    },
-                    'nsfw_count': sum(1 for s in results['discovered_subreddits'] if s.get('is_nsfw', False)),
-                    'sfw_count': sum(1 for s in results['discovered_subreddits'] if not s.get('is_nsfw', False)),
-                    'errors': len(results['errors']),
-                    'user_selection': results['user_selection_method']
+                    'stats_collected': len(results['stats_collected']),
+                    'errors': len(results['errors'])
                 },
                 'details': results
             }
