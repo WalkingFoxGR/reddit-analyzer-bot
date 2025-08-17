@@ -1610,7 +1610,8 @@ class RedditAnalyzer:
     def discover_subreddits_from_seed(self, seed_subreddit: str, 
                                     max_users: int = 20,
                                     max_subreddits_per_user: int = 10,
-                                    full_analysis: bool = True) -> Dict[str, Any]:
+                                    full_analysis: bool = True,
+                                    analyze_all: bool = True) -> Dict[str, Any]:
         """
         Enhanced 4-step discovery process with user selection info
         """
