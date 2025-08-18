@@ -1812,7 +1812,7 @@ class RedditAnalyzer:
                 discovered_subs.items(),
                 key=lambda x: (len(x[1]['users']) * 2 + x[1].get('avg_discovered_score', 0) / 10),
                 reverse=True
-            )[:100]  # Increased from 30 to 100!
+            )#[:100]  # Increased from 30 to 100!
             
             # Step 4: FULL analysis for ALL discovered subreddits with CONCURRENT processing
             if analyze_all:
