@@ -277,6 +277,56 @@ class RedditAnalyzer:
         except Exception:
             # If we can't determine, assume regular subreddit
             return False
+        
+    def list_moderators(self, subreddit_name: str) -> Dict[str, Any]:
+        """Return subreddit moderators with permissions and join dates (if available)"""
+        try:
+            sub = self.enhanced_safe_reddit_call(
+                lambda: self.reddit.subreddit(subreddit_name)
+            )
+
+            moderators = []
+            # PRAW returns Redditor models with 'mod_permissions' and often 'date'
+            for rel in sub.moderator():
+                try:
+                    name = rel.name
+                    perms = list(getattr(rel, "mod_permissions", []) or [])
+                    joined_ts = getattr(rel, "date", None)
+                    joined_iso = None
+                    if joined_ts:
+                        try:
+                            joined_iso = datetime.utcfromtimestamp(
+                                joined_ts
+                            ).isoformat()
+                        except Exception:
+                            joined_iso = None
+
+                    moderators.append(
+                        {
+                            "username": name,
+                            "permissions": perms,
+                            "has_full_perms": "all" in perms or "config" in perms,
+                            "joined_utc": joined_iso,
+                        }
+                    )
+                except Exception:
+                    continue
+
+            # Sort: full-perms first, then alphabetically
+            moderators.sort(
+                key=lambda m: (not m["has_full_perms"], m["username"].lower())
+            )
+
+            return {
+                "success": True,
+                "subreddit": sub.display_name,
+                "count": len(moderators),
+                "moderators": moderators,
+                "modmail_url": f"https://www.reddit.com/message/compose?to=%2Fr%2F{sub.display_name}",
+            }
+        except Exception as e:
+            logging.error(f"Error listing moderators for {subreddit_name}: {e}")
+            return {"success": False, "error": str(e)}
 
     def analyze_post_consistency(self, post_scores: List[int], is_nsfw: bool = False) -> Dict[str, Any]:
         """Analyze consistency of post performance"""
@@ -1920,6 +1970,136 @@ class RedditAnalyzer:
         except Exception as e:
             logging.error(f"Error in discovery process: {e}")
             return {'success': False, 'error': str(e)}
+        
+
+    def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
+        """Get detailed moderator information for a subreddit"""
+        try:
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            # Check if subreddit is accessible
+            try:
+                subscribers = self.enhanced_safe_reddit_call(lambda: subreddit.subscribers)
+                display_name = self.enhanced_safe_reddit_call(lambda: subreddit.display_name)
+            except Exception as e:
+                if "Redirect" in str(e) or "404" in str(e):
+                    return {'success': False, 'error': f'Subreddit r/{subreddit_name} not found'}
+                elif "403" in str(e) or "private" in str(e).lower():
+                    return {'success': False, 'error': f'Subreddit r/{subreddit_name} is private'}
+                else:
+                    raise
+            
+            # Get moderators
+            moderators = []
+            mod_count = 0
+            
+            try:
+                for moderator in subreddit.moderators():
+                    try:
+                        # Get moderator info
+                        mod_info = {
+                            'username': moderator.name,
+                            'permissions': [],
+                            'is_suspended': False,
+                            'mod_since': None,
+                            'account_age_days': None,
+                            'total_karma': None,
+                            'link_karma': None,
+                            'comment_karma': None
+                        }
+                        
+                        # Get permissions if available
+                        if hasattr(moderator, 'mod_permissions'):
+                            mod_info['permissions'] = moderator.mod_permissions or ['all']
+                        
+                        # Try to get additional user info
+                        try:
+                            user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(moderator.name))
+                            
+                            # Basic account info
+                            if hasattr(user, 'created_utc'):
+                                account_age = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
+                                mod_info['account_age_days'] = account_age
+                                mod_info['mod_since'] = datetime.utcfromtimestamp(user.created_utc).isoformat()
+                            
+                            # Karma info (if accessible)
+                            if hasattr(user, 'total_karma'):
+                                mod_info['total_karma'] = user.total_karma
+                            if hasattr(user, 'link_karma'):
+                                mod_info['link_karma'] = user.link_karma
+                            if hasattr(user, 'comment_karma'):
+                                mod_info['comment_karma'] = user.comment_karma
+                                
+                        except Exception as user_error:
+                            # User might be suspended/deleted
+                            if 'suspended' in str(user_error).lower():
+                                mod_info['is_suspended'] = True
+                            logging.warning(f"Could not get info for moderator {moderator.name}: {user_error}")
+                        
+                        moderators.append(mod_info)
+                        mod_count += 1
+                        
+                        # Rate limiting
+                        if mod_count % 5 == 0:
+                            time.sleep(0.3)
+                            
+                    except Exception as mod_error:
+                        logging.warning(f"Error processing moderator: {mod_error}")
+                        continue
+                        
+            except Exception as e:
+                logging.error(f"Error getting moderators: {e}")
+                return {
+                    'success': False,
+                    'error': f'Could not access moderator list for r/{subreddit_name}: {str(e)}'
+                }
+            
+            # Get additional subreddit info
+            subreddit_info = {}
+            try:
+                subreddit_info = {
+                    'display_name': display_name,
+                    'subscribers': subscribers,
+                    'created_utc': datetime.utcfromtimestamp(subreddit.created_utc).isoformat() if hasattr(subreddit, 'created_utc') else None,
+                    'over18': getattr(subreddit, 'over18', False),
+                    'public_description': getattr(subreddit, 'public_description', ''),
+                    'description': getattr(subreddit, 'description', ''),
+                    'submission_type': getattr(subreddit, 'submission_type', 'any')
+                }
+            except Exception as info_error:
+                logging.warning(f"Could not get full subreddit info: {info_error}")
+            
+            # Categorize moderators
+            active_mods = [m for m in moderators if not m['is_suspended']]
+            suspended_mods = [m for m in moderators if m['is_suspended']]
+            
+            # Permission analysis
+            permission_counts = defaultdict(int)
+            for mod in active_mods:
+                for perm in mod['permissions']:
+                    permission_counts[perm] += 1
+            
+            # Sort moderators by total karma (highest first), then by username
+            active_mods.sort(key=lambda x: (x['total_karma'] or 0, x['username']), reverse=True)
+            
+            return {
+                'success': True,
+                'subreddit': subreddit_name,
+                'subreddit_info': subreddit_info,
+                'moderators': {
+                    'active': active_mods,
+                    'suspended': suspended_mods,
+                    'total_count': len(moderators),
+                    'active_count': len(active_mods),
+                    'suspended_count': len(suspended_mods)
+                },
+                'permission_analysis': dict(permission_counts),
+                'analyzed_at': datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logging.error(f"Error analyzing moderators for {subreddit_name}: {e}")
+            return {'success': False, 'error': str(e)}
 
     def save_discovered_to_airtable(self, discovery_data: Dict[str, Any]) -> bool:
         """Save discovered subreddit to Airtable"""
@@ -1964,6 +2144,8 @@ class RedditAnalyzer:
         cleaned = re.sub(r'\s+', ' ', input_text.strip())
         subreddits = re.split(r'[,\s]+', cleaned)
         return [sub.strip() for sub in subreddits if sub.strip()]
+    
+    
     
     async def analyze_multiple_concurrent(self, subreddits: list, days: int = 7):
         """Analyze multiple subreddits concurrently"""
@@ -2076,6 +2258,7 @@ def root():
             'niche_search': '/search-and-analyze (POST)',
             'scrape': '/scrape (POST)',
             'rules': '/rules (POST)',
+            'moderators': '/moderators (POST)',
             'flairs': '/flairs (POST)'
         },
         'documentation': 'https://github.com/your-repo/docs'
@@ -2102,6 +2285,36 @@ def analyze_endpoint():
     
     result = analyzer.analyze_subreddit_with_timing(subreddit, days)
     return jsonify(result)
+
+
+@app.route('/moderators', methods=['POST'])
+def get_moderators_endpoint():
+    """Get subreddit moderators and their information"""
+    data = request.json
+    subreddit_name = data.get('subreddit')
+    
+    if not subreddit_name:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    # Validate subreddit exists
+    validation = validate_subreddit(subreddit_name)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    try:
+        result = analyzer.get_subreddit_moderators(subreddit_name)
+        return jsonify(result)
+        
+    except Exception as e:
+        logging.error(f"Error in moderators endpoint: {e}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to get moderators: {str(e)}'
+        }), 500
 
 @app.route('/requirements', methods=['POST'])
 def requirements_endpoint():
@@ -2643,6 +2856,31 @@ def analyze_flairs():
                 'success': False,
                 'error': f'Analysis failed: {error_message}'
             }), 500
+        
+        
+@app.route("/moderators", methods=["POST"])
+def moderators_endpoint():
+    data = request.json
+    subreddit = data.get("subreddit")
+    if not subreddit:
+        return jsonify({"success": False, "error": "No subreddit provided"}), 400
+
+    validation = validate_subreddit(subreddit)
+    if not validation["valid"]:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": validation["message"],
+                    "error_type": validation["error"],
+                }
+            ),
+            400,
+        )
+
+    result = analyzer.list_moderators(subreddit)
+    status = 200 if result.get("success") else 500
+    return jsonify(result), status        
         
 
 @app.route('/discover', methods=['POST'])
