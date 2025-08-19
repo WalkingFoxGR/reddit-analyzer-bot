@@ -44,14 +44,6 @@ class RedditAnalyzer:
             try:
                 self.airtable = Api(api_key)
                 self.karma_table = self.airtable.table(base_id, 'Karma Requirements')
-                
-                try:
-                    self.moderators_table = self.airtable.table(base_id, 'Moderators')
-                    logging.info("Moderators table initialized")
-                except Exception as e:
-                    logging.error(f"Failed to initialize Moderators table: {e}")
-                    self.moderators_table = None
-
                 logging.info("Airtable initialized successfully")
             except Exception as e:
                 logging.error(f"Failed to initialize Airtable: {e}")
@@ -618,24 +610,6 @@ class RedditAnalyzer:
                     time.sleep(2)
                     logging.info(f"Processed {post_count} posts for r/{subreddit_name}")
             
-            # Add moderator fetching (after line 650)
-            try:
-                mod_result = self.get_subreddit_moderators(subreddit_name)
-                if mod_result.get('success'):
-                    result['moderators'] = mod_result['moderators'][:10]  # Top 10
-                    result['moderator_count'] = mod_result['moderator_count']
-                    
-                    # Check for powermods
-                    powermods = [m for m in mod_result['moderators'] 
-                            if self.is_powermod(m['username'])]
-                    if powermods:
-                        result['has_powermods'] = True
-                        result['powermod_count'] = len(powermods)
-            except Exception as e:
-                logging.warning(f"Could not fetch moderators: {e}")
-                result['moderators'] = []
-                result['moderator_count'] = 0
-
             # Also check top posts to ensure we get the actual top post
             try:
                 time_filter = 'week' if days <= 7 else 'month' if days <= 30 else 'all'
@@ -734,20 +708,6 @@ class RedditAnalyzer:
         except Exception as e:
             logging.error(f"Error analyzing subreddit {subreddit_name}: {e}")
             return {'success': False, 'error': str(e)}
-        
-    def is_powermod(self, username: str) -> bool:
-        """Check if a user is a powermod (mods 5+ subreddits)"""
-        if not self.moderators_table:
-            return False
-        
-        try:
-            all_mods = self.moderators_table.all()
-            for record in all_mods:
-                if record['fields'].get('Username', '').lower() == username.lower():
-                    return record['fields'].get('Is_Powermod', False)
-            return False
-        except:
-            return False
     
     # DEPRECATED: Keep old method for backward compatibility
     def calculate_effectiveness(self, avg_posts_per_day: float, avg_score_per_post: float,
@@ -1568,11 +1528,6 @@ class RedditAnalyzer:
                     logging.warning(f"Error processing moderator {moderator}: {e}")
                     continue
             
-            # After successfully getting moderators
-            if moderators:
-                # Save to Airtable
-                self.save_moderators_to_airtable(subreddit_name, moderators)
-
             return {
                 'success': True,
                 'subreddit': subreddit_name,
@@ -1633,173 +1588,6 @@ class RedditAnalyzer:
             
         except Exception as e:
             logging.error(f"Error in enhanced analysis: {e}")
-            return {'success': False, 'error': str(e)}
-        
-
-    def save_moderators_to_airtable(self, subreddit_name: str, moderators: List[Dict]) -> bool:
-        """Save moderators to Airtable and track cross-moderation"""
-        if not self.airtable or not self.moderators_table:
-            logging.warning("Airtable or moderators_table not available")
-            return False
-        
-        try:
-            # Get the subreddit record ID from Karma Requirements table
-            subreddit_record = self.get_existing_record(subreddit_name)
-            logging.info(f"Looking for subreddit record for: {subreddit_name}")
-            
-            if not subreddit_record:
-                logging.info(f"No existing record found, creating new record for {subreddit_name}")
-                # Create a basic record for this subreddit if it doesn't exist
-                try:
-                    subreddit_record = self.karma_table.create({
-                        'Subreddit': self.normalize_subreddit_name(subreddit_name),
-                        'Display_Name': subreddit_name,
-                        'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d')
-                    })
-                    logging.info(f"Created new record with ID: {subreddit_record['id']}")
-                except Exception as create_error:
-                    logging.error(f"Failed to create subreddit record: {create_error}")
-                    return False
-            else:
-                logging.info(f"Found existing record with ID: {subreddit_record['id']}")
-            
-            subreddit_record_id = subreddit_record['id']
-            logging.info(f"Processing {len(moderators)} moderators for subreddit record ID: {subreddit_record_id}")
-            
-            # Continue with the rest of your moderator processing...
-            for mod in moderators:
-                try:
-                    # Check if moderator already exists
-                    existing_mod = None
-                    all_mods = self.moderators_table.all()
-                    for record in all_mods:
-                        if record['fields'].get('Username', '').lower() == mod['username'].lower():
-                            existing_mod = record
-                            break
-                    
-                    mod_data = {
-                        'Username': mod['username'],
-                        'Link_Karma': mod.get('link_karma', 0),
-                        'Comment_Karma': mod.get('comment_karma', 0),
-                        'Account_Age_Days': mod.get('account_age_days', 0),
-                        'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d'),
-                        'Is_Employee': mod.get('is_employee', False),
-                        'Has_Gold': mod.get('is_gold', False)
-                    }
-                    
-                    if existing_mod:
-                        logging.info(f"Updating existing moderator: {mod['username']}")
-                        # Update existing moderator
-                        existing_subs = existing_mod['fields'].get('Subreddits_Moderated', [])
-                        if subreddit_record_id not in existing_subs:
-                            existing_subs.append(subreddit_record_id)
-                        
-                        mod_data['Subreddits_Moderated'] = existing_subs
-                        mod_data['Total_Subreddits'] = len(existing_subs)
-                        mod_data['Is_Powermod'] = len(existing_subs) >= 5
-                        
-                        # Update permissions JSON
-                        existing_perms = existing_mod['fields'].get('Permissions', '{}')
-                        try:
-                            perms_dict = json.loads(existing_perms) if existing_perms else {}
-                        except:
-                            perms_dict = {}
-                        perms_dict[subreddit_name] = mod.get('mod_permissions', ['all'])
-                        mod_data['Permissions'] = json.dumps(perms_dict)
-                        
-                        self.moderators_table.update(existing_mod['id'], mod_data)
-                    else:
-                        logging.info(f"Creating new moderator: {mod['username']}")
-                        # Create new moderator record
-                        mod_data['Subreddits_Moderated'] = [subreddit_record_id]
-                        mod_data['Total_Subreddits'] = 1
-                        mod_data['Is_Powermod'] = False
-                        mod_data['Permissions'] = json.dumps({
-                            subreddit_name: mod.get('mod_permissions', ['all'])
-                        })
-                        
-                        self.moderators_table.create(mod_data)
-                        
-                except Exception as e:
-                    logging.error(f"Error saving moderator {mod.get('username')}: {e}")
-                    continue
-            
-            # Update the subreddit record (with better error handling)
-            logging.info(f"Attempting to update subreddit record {subreddit_record_id}")
-            try:
-                update_data = {'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d')}
-                
-                # Try to add moderator count if field exists
-                try:
-                    # First try with all fields
-                    test_data = {
-                        'Moderator_Count': len(moderators),
-                        'Moderators_Checked': True,
-                        'Moderators_Check_Date': datetime.utcnow().strftime('%Y-%m-%d')
-                    }
-                    self.karma_table.update(subreddit_record_id, test_data)
-                    logging.info("Successfully updated with all moderator fields")
-                except Exception as field_error:
-                    logging.warning(f"Moderator fields don't exist, using basic update: {field_error}")
-                    self.karma_table.update(subreddit_record_id, update_data)
-                    logging.info("Successfully updated with basic fields")
-                    
-            except Exception as update_error:
-                logging.error(f"Failed to update subreddit record: {update_error}")
-                return False
-            
-            logging.info(f"Successfully saved {len(moderators)} moderators for {subreddit_name}")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Failed to save moderators to Airtable: {e}")
-            return False
-
-    def find_shared_moderators(self, subreddit_names: List[str]) -> Dict[str, Any]:
-        """Find moderators that moderate multiple specified subreddits"""
-        if not self.moderators_table:
-            return {'success': False, 'error': 'Moderators table not available'}
-        
-        try:
-            all_mods = self.moderators_table.all()
-            shared_mods = []
-            
-            # Normalize subreddit names for comparison
-            normalized_subs = [self.normalize_subreddit_name(s) for s in subreddit_names]
-            
-            for mod_record in all_mods:
-                mod_fields = mod_record['fields']
-                
-                # Get subreddits this mod moderates
-                mod_subs = []
-                if 'Subreddits_Moderated' in mod_fields:
-                    # Get the linked subreddit records
-                    for sub_id in mod_fields['Subreddits_Moderated']:
-                        try:
-                            sub_record = self.karma_table.get(sub_id)
-                            sub_name = sub_record['fields'].get('Subreddit', '').lower()
-                            if sub_name in normalized_subs:
-                                mod_subs.append(sub_name)
-                        except:
-                            continue
-                
-                # If this mod moderates 2+ of our target subreddits
-                if len(mod_subs) >= 2:
-                    shared_mods.append({
-                        'username': mod_fields.get('Username'),
-                        'subreddits_in_common': mod_subs,
-                        'total_subreddits': mod_fields.get('Total_Subreddits', 0),
-                        'is_powermod': mod_fields.get('Is_Powermod', False)
-                    })
-            
-            return {
-                'success': True,
-                'shared_moderators': shared_mods,
-                'total_shared': len(shared_mods)
-            }
-            
-        except Exception as e:
-            logging.error(f"Error finding shared moderators: {e}")
             return {'success': False, 'error': str(e)}
     
     def analyze_subreddit(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
@@ -2232,21 +2020,8 @@ class RedditAnalyzer:
                                 'avg_discovered_score': sub_data.get('avg_discovered_score', 0),
                                 'analysis_depth': 'full' if task_number <= 20 else 'quick'
                             }
-
-                            # Fetch and save moderators for discovered subreddits
-                            try:
-                                mod_result = self.get_subreddit_moderators(sub_data['display_name'])
-                                if mod_result.get('success'):
-                                    record_data['moderator_count'] = mod_result['moderator_count']
-                                    record_data['has_powermods'] = any(
-                                        self.is_powermod(m['username']) 
-                                        for m in mod_result['moderators']
-                                    )
-                            except:
-                                pass
                             
                             results['discovered_subreddits'].append(record_data)
-                            
                             
                             # Save to Airtable in background (non-blocking)
                             if self.airtable:
