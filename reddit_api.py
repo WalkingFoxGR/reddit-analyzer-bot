@@ -1710,13 +1710,23 @@ class RedditAnalyzer:
                     logging.warning(f"Error saving moderator {mod.get('username')}: {e}")
                     continue
             
-            # Update the subreddit record with moderator count
-            self.karma_table.update(subreddit_record_id, {
-                'Moderator_Count': len(moderators),
-                'Moderators_Checked': True,
-                'Moderators_Check_Date': datetime.utcnow().strftime('%Y-%m-%d')
-            })
-            
+            # Update the subreddit record with moderator count (only if fields exist)
+            try:
+                self.karma_table.update(subreddit_record_id, {
+                    'Moderator_Count': len(moderators),
+                    'Moderators_Checked': True,
+                    'Moderators_Check_Date': datetime.utcnow().strftime('%Y-%m-%d')
+                })
+            except Exception as field_error:
+                logging.warning(f"Some moderator fields missing in Airtable: {field_error}")
+                # Try with minimal update
+                try:
+                    self.karma_table.update(subreddit_record_id, {
+                        'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d')
+                    })
+                except:
+                    pass  # Skip if even Last_Updated doesn't exist
+
             return True
             
         except Exception as e:
