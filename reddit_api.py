@@ -1450,6 +1450,55 @@ class RedditAnalyzer:
                 'error': str(e)
             }
     
+    def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
+        """Fetch moderators for a subreddit"""
+        try:
+            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+            
+            moderators = []
+            mod_count = 0
+            
+            # Get moderator list
+            for moderator in subreddit.moderator():
+                try:
+                    mod_info = {
+                        'username': moderator.name,
+                        'mod_permissions': moderator.mod_permissions,
+                        'added_date': datetime.utcfromtimestamp(moderator.date).isoformat() if hasattr(moderator, 'date') else None
+                    }
+                    
+                    # Try to get additional info about the moderator
+                    try:
+                        user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(moderator.name))
+                        mod_info['link_karma'] = user.link_karma
+                        mod_info['comment_karma'] = user.comment_karma
+                        mod_info['account_age_days'] = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
+                        mod_info['is_suspended'] = False
+                    except:
+                        mod_info['is_suspended'] = True
+                        
+                    moderators.append(mod_info)
+                    mod_count += 1
+                    
+                    # Rate limiting
+                    if mod_count % 5 == 0:
+                        time.sleep(0.5)
+                        
+                except Exception as e:
+                    logging.warning(f"Error getting mod info: {e}")
+                    continue
+            
+            return {
+                'success': True,
+                'subreddit': subreddit_name,
+                'moderator_count': len(moderators),
+                'moderators': moderators
+            }
+            
+        except Exception as e:
+            logging.error(f"Error fetching moderators for {subreddit_name}: {e}")
+            return {'success': False, 'error': str(e)}
+
     def analyze_subreddit_with_timing(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """FAST subreddit analysis with enhanced realistic scoring"""
         try:
@@ -2697,29 +2746,26 @@ def analyze_flairs():
             }), 500
         
         
-@app.route("/moderators", methods=["POST"])
-def moderators_endpoint():
+@app.route('/moderators', methods=['POST'])
+def get_moderators_endpoint():
+    """Get moderators for a subreddit"""
     data = request.json
-    subreddit = data.get("subreddit")
-    if not subreddit:
-        return jsonify({"success": False, "error": "No subreddit provided"}), 400
-
-    validation = validate_subreddit(subreddit)
-    if not validation["valid"]:
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": validation["message"],
-                    "error_type": validation["error"],
-                }
-            ),
-            400,
-        )
-
-    result = analyzer.list_moderators(subreddit)
-    status = 200 if result.get("success") else 500
-    return jsonify(result), status        
+    subreddit_name = data.get('subreddit')
+    
+    if not subreddit_name:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    # Validate subreddit exists
+    validation = validate_subreddit(subreddit_name)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    result = analyzer.get_subreddit_moderators(subreddit_name)
+    return jsonify(result)      
         
 
 @app.route('/discover', methods=['POST'])
