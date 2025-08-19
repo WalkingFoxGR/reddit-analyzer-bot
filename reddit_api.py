@@ -33,6 +33,13 @@ class RedditAnalyzer:
         api_key = os.getenv('AIRTABLE_API_KEY')
         base_id = os.getenv('AIRTABLE_BASE_ID')
         
+        # ADD THIS DEBUG LOGGING
+        refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
+        if refresh_token:
+            logging.info(f"Refresh token found: {refresh_token[:10]}...")
+        else:
+            logging.error("NO REFRESH TOKEN FOUND IN ENVIRONMENT!")
+        
         if api_key and base_id:
             try:
                 self.airtable = Api(api_key)
@@ -96,23 +103,24 @@ class RedditAnalyzer:
         return name.lower().strip()
 
     def _create_reddit_instance(self):
-        """Create Reddit instance with refresh token"""
+        """Create Reddit instance with refresh token if available"""
         refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
         
+        # Log what we're doing
         if refresh_token:
-            # Use refresh token authentication (recommended)
+            logging.info("Creating authenticated Reddit instance with refresh token")
             return praw.Reddit(
                 client_id=REDDIT_CLIENT_ID,
                 client_secret=REDDIT_CLIENT_SECRET,
                 user_agent=REDDIT_USER_AGENT,
-                refresh_token=refresh_token,
+                refresh_token=refresh_token,  # THIS IS THE KEY LINE
                 ratelimit_seconds=300,
                 timeout=30,
                 connection_pool_size=5,
                 max_retries=2
             )
         else:
-            # Fallback to read-only mode (can't see moderators)
+            logging.warning("Creating read-only Reddit instance (no refresh token)")
             return praw.Reddit(
                 client_id=REDDIT_CLIENT_ID,
                 client_secret=REDDIT_CLIENT_SECRET,
@@ -294,20 +302,6 @@ class RedditAnalyzer:
             # If we can't determine, assume regular subreddit
             return False
         
-    def _create_reddit_instance(self):
-        """Create an authenticated Reddit instance"""
-        return praw.Reddit(
-            client_id=REDDIT_CLIENT_ID,
-            client_secret=REDDIT_CLIENT_SECRET,
-            user_agent=REDDIT_USER_AGENT,
-            # ADD THESE TWO LINES FOR AUTHENTICATION:
-            username=os.getenv('REDDIT_USERNAME'),  # Your Reddit username
-            password=os.getenv('REDDIT_PASSWORD'),  # Your Reddit password
-            ratelimit_seconds=300,
-            timeout=30,
-            connection_pool_size=5,
-            max_retries=2
-        )
 
     def list_moderators(self, subreddit_name: str) -> Dict[str, Any]:
         """Return subreddit moderators with permissions and join dates (if available)"""
@@ -1485,73 +1479,54 @@ class RedditAnalyzer:
     def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
         """Fetch moderators for a subreddit (requires authentication)"""
         try:
-            # Check if we're authenticated
-            try:
-                me = self.reddit.user.me()
-                if not me:
-                    return {
-                        'success': False,
-                        'error': 'Bot not authenticated. Cannot fetch moderators without Reddit login.'
-                    }
-            except:
+            # Better authentication check
+            refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
+            if not refresh_token:
                 return {
                     'success': False,
                     'error': 'Bot not authenticated. Cannot fetch moderators without Reddit login.'
                 }
             
+            # Test if we can actually authenticate
+            try:
+                # This will fail if not properly authenticated
+                me = self.enhanced_safe_reddit_call(lambda: self.reddit.user.me())
+                if me:
+                    logging.info(f"Authenticated as Reddit user: {me.name}")
+            except Exception as e:
+                logging.error(f"Authentication test failed: {e}")
+                return {
+                    'success': False,
+                    'error': f'Authentication failed: {str(e)}'
+                }
+            
+            # Now try to get the subreddit
             subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
             
             moderators = []
             
-            try:
-                # This will only work if authenticated
-                for moderator in subreddit.moderator():
-                    try:
-                        # moderator is a Redditor object when authenticated
-                        mod_info = {
-                            'username': moderator.name,
-                            'mod_permissions': list(moderator.mod_permissions) if hasattr(moderator, 'mod_permissions') else ['all'],
-                        }
-                        
-                        # Get user details
-                        try:
-                            mod_info['link_karma'] = moderator.link_karma
-                            mod_info['comment_karma'] = moderator.comment_karma
-                            mod_info['account_age_days'] = (datetime.utcnow() - datetime.utcfromtimestamp(moderator.created_utc)).days
-                            mod_info['is_gold'] = moderator.is_gold
-                            mod_info['is_employee'] = moderator.is_employee
-                            mod_info['has_verified_email'] = moderator.has_verified_email
-                        except AttributeError:
-                            # Some attributes might not be available
-                            pass
-                        
-                        moderators.append(mod_info)
-                        
-                        # Rate limiting
-                        if len(moderators) % 5 == 0:
-                            time.sleep(0.3)
-                            
-                    except Exception as e:
-                        logging.warning(f"Error processing moderator {moderator}: {e}")
-                        continue
-                        
-            except Exception as e:
-                error_msg = str(e).lower()
-                if 'forbidden' in error_msg or '403' in error_msg:
-                    return {
-                        'success': False,
-                        'error': 'Access denied. This subreddit does not allow viewing moderators.'
+            # Get moderator list
+            mod_list = self.enhanced_safe_reddit_call(lambda: list(subreddit.moderator()))
+            
+            for moderator in mod_list:
+                try:
+                    mod_info = {
+                        'username': moderator.name,
+                        'mod_permissions': list(moderator.mod_permissions) if hasattr(moderator, 'mod_permissions') else ['all'],
                     }
-                elif 'authentication' in error_msg or '401' in error_msg:
-                    return {
-                        'success': False,
-                        'error': 'Authentication required. Bot needs Reddit login to fetch moderators.'
-                    }
-                else:
-                    return {
-                        'success': False,
-                        'error': f'Unable to fetch moderators: {str(e)}'
-                    }
+                    
+                    # Get additional info
+                    mod_info['link_karma'] = getattr(moderator, 'link_karma', 0)
+                    mod_info['comment_karma'] = getattr(moderator, 'comment_karma', 0)
+                    
+                    if hasattr(moderator, 'created_utc'):
+                        mod_info['account_age_days'] = (datetime.utcnow() - datetime.utcfromtimestamp(moderator.created_utc)).days
+                    
+                    moderators.append(mod_info)
+                    
+                except Exception as e:
+                    logging.warning(f"Error processing moderator {moderator}: {e}")
+                    continue
             
             return {
                 'success': True,
