@@ -39,20 +39,19 @@ class RedditAnalyzer:
             logging.info(f"Refresh token found: {refresh_token[:10]}...")
         else:
             logging.error("NO REFRESH TOKEN FOUND IN ENVIRONMENT!")
-
-
-        if self.airtable:
-            try:
-                self.moderators_table = self.airtable.table(base_id, 'Moderators')
-                logging.info("Moderators table initialized")
-            except Exception as e:
-                logging.error(f"Failed to initialize Moderators table: {e}")
-                self.moderators_table = None
         
         if api_key and base_id:
             try:
                 self.airtable = Api(api_key)
                 self.karma_table = self.airtable.table(base_id, 'Karma Requirements')
+                
+                try:
+                    self.moderators_table = self.airtable.table(base_id, 'Moderators')
+                    logging.info("Moderators table initialized")
+                except Exception as e:
+                    logging.error(f"Failed to initialize Moderators table: {e}")
+                    self.moderators_table = None
+
                 logging.info("Airtable initialized successfully")
             except Exception as e:
                 logging.error(f"Failed to initialize Airtable: {e}")
