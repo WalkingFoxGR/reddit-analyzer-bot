@@ -1458,35 +1458,58 @@ class RedditAnalyzer:
             moderators = []
             mod_count = 0
             
-            # Get moderator list
-            for moderator in subreddit.moderator():
-                try:
-                    mod_info = {
-                        'username': moderator.name,
-                        'mod_permissions': moderator.mod_permissions,
-                        'added_date': datetime.utcfromtimestamp(moderator.date).isoformat() if hasattr(moderator, 'date') else None
-                    }
-                    
-                    # Try to get additional info about the moderator
+            try:
+                # Get moderator list - correct way
+                mod_list = self.enhanced_safe_reddit_call(lambda: list(subreddit.moderator()))
+                
+                for moderator in mod_list:
                     try:
-                        user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(moderator.name))
-                        mod_info['link_karma'] = user.link_karma
-                        mod_info['comment_karma'] = user.comment_karma
-                        mod_info['account_age_days'] = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
-                        mod_info['is_suspended'] = False
-                    except:
-                        mod_info['is_suspended'] = True
+                        mod_info = {
+                            'username': str(moderator),  # Convert to string
+                            'mod_permissions': None,
+                            'added_date': None
+                        }
                         
-                    moderators.append(mod_info)
-                    mod_count += 1
-                    
-                    # Rate limiting
-                    if mod_count % 5 == 0:
-                        time.sleep(0.5)
+                        # Try to get permissions if available
+                        if hasattr(moderator, 'mod_permissions'):
+                            mod_info['mod_permissions'] = moderator.mod_permissions
                         
-                except Exception as e:
-                    logging.warning(f"Error getting mod info: {e}")
-                    continue
+                        # Try to get additional info about the moderator
+                        try:
+                            user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(str(moderator)))
+                            mod_info['link_karma'] = getattr(user, 'link_karma', 0)
+                            mod_info['comment_karma'] = getattr(user, 'comment_karma', 0)
+                            
+                            if hasattr(user, 'created_utc'):
+                                mod_info['account_age_days'] = (datetime.utcnow() - datetime.utcfromtimestamp(user.created_utc)).days
+                            
+                            mod_info['is_suspended'] = False
+                        except Exception as e:
+                            if 'suspended' in str(e).lower():
+                                mod_info['is_suspended'] = True
+                            else:
+                                # User might be deleted or shadowbanned
+                                mod_info['link_karma'] = None
+                                mod_info['comment_karma'] = None
+                                mod_info['account_age_days'] = None
+                        
+                        moderators.append(mod_info)
+                        mod_count += 1
+                        
+                        # Rate limiting
+                        if mod_count % 5 == 0:
+                            time.sleep(0.5)
+                            
+                    except Exception as e:
+                        logging.warning(f"Error getting mod info for {moderator}: {e}")
+                        continue
+            except Exception as e:
+                logging.error(f"Error getting moderator list: {e}")
+                # Some subreddits might not allow viewing moderators
+                return {
+                    'success': False, 
+                    'error': 'Unable to access moderator list. The subreddit might be private or restricted.'
+                }
             
             return {
                 'success': True,
