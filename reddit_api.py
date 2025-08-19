@@ -1639,22 +1639,34 @@ class RedditAnalyzer:
     def save_moderators_to_airtable(self, subreddit_name: str, moderators: List[Dict]) -> bool:
         """Save moderators to Airtable and track cross-moderation"""
         if not self.airtable or not self.moderators_table:
+            logging.warning("Airtable or moderators_table not available")
             return False
         
         try:
             # Get the subreddit record ID from Karma Requirements table
             subreddit_record = self.get_existing_record(subreddit_name)
+            logging.info(f"Looking for subreddit record for: {subreddit_name}")
+            
             if not subreddit_record:
+                logging.info(f"No existing record found, creating new record for {subreddit_name}")
                 # Create a basic record for this subreddit if it doesn't exist
-                subreddit_record = self.karma_table.create({
-                    'Subreddit': self.normalize_subreddit_name(subreddit_name),
-                    'Display_Name': subreddit_name,
-                    'Moderators_Checked': True,
-                    'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d')
-                })
+                try:
+                    subreddit_record = self.karma_table.create({
+                        'Subreddit': self.normalize_subreddit_name(subreddit_name),
+                        'Display_Name': subreddit_name,
+                        'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d')
+                    })
+                    logging.info(f"Created new record with ID: {subreddit_record['id']}")
+                except Exception as create_error:
+                    logging.error(f"Failed to create subreddit record: {create_error}")
+                    return False
+            else:
+                logging.info(f"Found existing record with ID: {subreddit_record['id']}")
             
             subreddit_record_id = subreddit_record['id']
+            logging.info(f"Processing {len(moderators)} moderators for subreddit record ID: {subreddit_record_id}")
             
+            # Continue with the rest of your moderator processing...
             for mod in moderators:
                 try:
                     # Check if moderator already exists
@@ -1676,6 +1688,7 @@ class RedditAnalyzer:
                     }
                     
                     if existing_mod:
+                        logging.info(f"Updating existing moderator: {mod['username']}")
                         # Update existing moderator
                         existing_subs = existing_mod['fields'].get('Subreddits_Moderated', [])
                         if subreddit_record_id not in existing_subs:
@@ -1696,6 +1709,7 @@ class RedditAnalyzer:
                         
                         self.moderators_table.update(existing_mod['id'], mod_data)
                     else:
+                        logging.info(f"Creating new moderator: {mod['username']}")
                         # Create new moderator record
                         mod_data['Subreddits_Moderated'] = [subreddit_record_id]
                         mod_data['Total_Subreddits'] = 1
@@ -1707,26 +1721,34 @@ class RedditAnalyzer:
                         self.moderators_table.create(mod_data)
                         
                 except Exception as e:
-                    logging.warning(f"Error saving moderator {mod.get('username')}: {e}")
+                    logging.error(f"Error saving moderator {mod.get('username')}: {e}")
                     continue
             
-            # Update the subreddit record with moderator count (only if fields exist)
+            # Update the subreddit record (with better error handling)
+            logging.info(f"Attempting to update subreddit record {subreddit_record_id}")
             try:
-                self.karma_table.update(subreddit_record_id, {
-                    'Moderator_Count': len(moderators),
-                    'Moderators_Checked': True,
-                    'Moderators_Check_Date': datetime.utcnow().strftime('%Y-%m-%d')
-                })
-            except Exception as field_error:
-                logging.warning(f"Some moderator fields missing in Airtable: {field_error}")
-                # Try with minimal update
+                update_data = {'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d')}
+                
+                # Try to add moderator count if field exists
                 try:
-                    self.karma_table.update(subreddit_record_id, {
-                        'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d')
-                    })
-                except:
-                    pass  # Skip if even Last_Updated doesn't exist
-
+                    # First try with all fields
+                    test_data = {
+                        'Moderator_Count': len(moderators),
+                        'Moderators_Checked': True,
+                        'Moderators_Check_Date': datetime.utcnow().strftime('%Y-%m-%d')
+                    }
+                    self.karma_table.update(subreddit_record_id, test_data)
+                    logging.info("Successfully updated with all moderator fields")
+                except Exception as field_error:
+                    logging.warning(f"Moderator fields don't exist, using basic update: {field_error}")
+                    self.karma_table.update(subreddit_record_id, update_data)
+                    logging.info("Successfully updated with basic fields")
+                    
+            except Exception as update_error:
+                logging.error(f"Failed to update subreddit record: {update_error}")
+                return False
+            
+            logging.info(f"Successfully saved {len(moderators)} moderators for {subreddit_name}")
             return True
             
         except Exception as e:
