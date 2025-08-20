@@ -29,32 +29,14 @@ REDDIT_USER_AGENT = os.getenv('REDDIT_USER_AGENT', 'RedditAnalyzer/1.0')
 
 class RedditAnalyzer:
     def __init__(self):
-        self.pool_size = 5
         self.airtable = None
-        self.reddit = self._create_reddit_instance(use_auth=False)  # Read-only for general operations
-        self.reddit_auth = self._create_reddit_instance(use_auth=True)  # Authenticated for mod operations
         api_key = os.getenv('AIRTABLE_API_KEY')
         base_id = os.getenv('AIRTABLE_BASE_ID')
-        
-        # ADD THIS DEBUG LOGGING
-        refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
-        if refresh_token:
-            logging.info(f"Refresh token found: {refresh_token[:10]}...")
-        else:
-            logging.error("NO REFRESH TOKEN FOUND IN ENVIRONMENT!")
         
         if api_key and base_id:
             try:
                 self.airtable = Api(api_key)
                 self.karma_table = self.airtable.table(base_id, 'Karma Requirements')
-                
-                try:
-                    self.moderators_table = self.airtable.table(base_id, 'Moderators')
-                    logging.info("Moderators table initialized")
-                except Exception as e:
-                    logging.error(f"Failed to initialize Moderators table: {e}")
-                    self.moderators_table = None
-
                 logging.info("Airtable initialized successfully")
             except Exception as e:
                 logging.error(f"Failed to initialize Airtable: {e}")
@@ -64,9 +46,7 @@ class RedditAnalyzer:
         
         # Enhanced connection pool management
         self.reddit_pool = []
-        for i in range(self.pool_size):  # ✅ Now pool_size exists
-            reddit_instance = self._create_reddit_instance(use_auth=False)
-            self.reddit_pool.append(reddit_instance)
+        self.pool_size = 5
         self.pool_lock = threading.Lock()
         self.pool_last_used = {}  # Track when each connection was last used
         self.pool_creation_time = {}  # Track when each connection was created
@@ -78,6 +58,16 @@ class RedditAnalyzer:
         
         # Add request semaphore to limit concurrent requests
         self.request_semaphore = Semaphore(5)  # Max 5 concurrent Reddit requests
+        
+        # Initialize main Reddit instance
+        self.reddit = self._create_reddit_instance()
+        
+        # Initialize Reddit connection pool with tracking
+        for i in range(self.pool_size):
+            reddit_instance = self._create_reddit_instance()
+            self.reddit_pool.append(reddit_instance)
+            self.pool_last_used[i] = time.time()
+            self.pool_creation_time[i] = time.time()
         
         # Cache for analysis results
         self.analysis_cache = {}
@@ -105,36 +95,18 @@ class RedditAnalyzer:
         name = subreddit_name.replace('r/', '').replace('/r/', '')
         return name.lower().strip()
 
-    def _create_reddit_instance(self, use_auth=False):
-        """Create Reddit instance with PROPER SCOPES for moderator access"""
-        if use_auth:
-            refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
-            if refresh_token:
-                logging.info("Creating authenticated Reddit instance with proper scopes")
-                return praw.Reddit(
-                    client_id=REDDIT_CLIENT_ID,
-                    client_secret=REDDIT_CLIENT_SECRET,
-                    user_agent=REDDIT_USER_AGENT,
-                    refresh_token=refresh_token,
-                    # These settings ensure proper scope handling
-                    ratelimit_seconds=300,
-                    timeout=30,
-                    connection_pool_size=5,
-                    max_retries=2
-                )
-        
-        # Read-only instance
-        logging.info("Creating read-only Reddit instance")
+    def _create_reddit_instance(self):
+        """Create a fresh Reddit instance"""
         return praw.Reddit(
             client_id=REDDIT_CLIENT_ID,
             client_secret=REDDIT_CLIENT_SECRET,
             user_agent=REDDIT_USER_AGENT,
             ratelimit_seconds=300,
             timeout=30,
-            connection_pool_size=5,
-            max_retries=2
+            connection_pool_size=5,  # Reduced from 10
+            max_retries=2  # Reduced from 3
         )
-        
+    
     def test_connection(self):
         """Test Reddit connection on initialization"""
         try:
@@ -177,7 +149,7 @@ class RedditAnalyzer:
                         pass
                     
                     # Create fresh connection
-                    self.reddit_pool[index] = self._create_reddit_instance(use_auth=False)
+                    self.reddit_pool[index] = self._create_reddit_instance()
                     self.pool_creation_time[index] = current_time
                 
                 # Update last used time
@@ -305,90 +277,6 @@ class RedditAnalyzer:
         except Exception:
             # If we can't determine, assume regular subreddit
             return False
-        
-
-    def list_moderators(self, subreddit_name: str) -> Dict[str, Any]:
-        """Return subreddit moderators with permissions and join dates (if available)"""
-        try:
-            # Store original reddit instance
-            original_reddit = self.reddit
-            
-            try:
-                # Switch to authenticated instance if available
-                refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
-                if refresh_token and hasattr(self, 'reddit_auth'):
-                    self.reddit = self.reddit_auth
-                    logging.info("Using authenticated instance for moderator list")
-                else:
-                    logging.info("Using read-only instance for moderator list (may have limited data)")
-                
-                sub = self.enhanced_safe_reddit_call(
-                    lambda: self.reddit.subreddit(subreddit_name)
-                )
-
-                moderators = []
-                
-                # PRAW returns Redditor models with 'mod_permissions' and often 'date'
-                for rel in sub.moderator():
-                    try:
-                        name = rel.name
-                        perms = list(getattr(rel, "mod_permissions", []) or [])
-                        joined_ts = getattr(rel, "date", None)
-                        joined_iso = None
-                        
-                        if joined_ts:
-                            try:
-                                joined_iso = datetime.utcfromtimestamp(
-                                    joined_ts
-                                ).isoformat()
-                            except Exception:
-                                joined_iso = None
-
-                        moderators.append(
-                            {
-                                "username": name,
-                                "permissions": perms,
-                                "has_full_perms": "all" in perms or "config" in perms,
-                                "joined_utc": joined_iso,
-                            }
-                        )
-                    except Exception as e:
-                        logging.warning(f"Error processing moderator: {e}")
-                        continue
-
-                # Sort: full-perms first, then alphabetically
-                moderators.sort(
-                    key=lambda m: (not m["has_full_perms"], m["username"].lower())
-                )
-
-                return {
-                    "success": True,
-                    "subreddit": sub.display_name,
-                    "count": len(moderators),
-                    "moderators": moderators,
-                    "modmail_url": f"https://www.reddit.com/message/compose?to=%2Fr%2F{sub.display_name}",
-                }
-                
-            finally:
-                # Always restore original reddit instance
-                self.reddit = original_reddit
-                
-        except Exception as e:
-            logging.error(f"Error listing moderators for {subreddit_name}: {e}")
-            
-            # Check if it's an authentication issue
-            if "403" in str(e) or "forbidden" in str(e).lower():
-                return {
-                    "success": False,
-                    "error": "This subreddit's moderator list is private or requires authentication"
-                }
-            elif "404" in str(e) or "not found" in str(e).lower():
-                return {
-                    "success": False,
-                    "error": f"Subreddit r/{subreddit_name} not found"
-                }
-            else:
-                return {"success": False, "error": str(e)}
 
     def analyze_post_consistency(self, post_scores: List[int], is_nsfw: bool = False) -> Dict[str, Any]:
         """Analyze consistency of post performance"""
@@ -646,8 +534,7 @@ class RedditAnalyzer:
                 if post_count % 100 == 0:
                     time.sleep(2)
                     logging.info(f"Processed {post_count} posts for r/{subreddit_name}")
-
-
+            
             # Also check top posts to ensure we get the actual top post
             try:
                 time_filter = 'week' if days <= 7 else 'month' if days <= 30 else 'all'
@@ -740,44 +627,12 @@ class RedditAnalyzer:
                 'reach_description': reach_description,
                 'has_high_variance': has_high_variance
             }
-
-            # Add moderator fetching (after line 650)
-            try:
-                mod_result = self.get_subreddit_moderators(subreddit_name)
-                if mod_result.get('success'):
-                    result['moderators'] = mod_result['moderators'][:10]  # Top 10
-                    result['moderator_count'] = mod_result['moderator_count']
-                    
-                    # Check for powermods
-                    powermods = [m for m in mod_result['moderators'] 
-                            if self.is_powermod(m['username'])]
-                    if powermods:
-                        result['has_powermods'] = True
-                        result['powermod_count'] = len(powermods)
-            except Exception as e:
-                logging.warning(f"Could not fetch moderators: {e}")
-                result['moderators'] = []
-                result['moderator_count'] = 0            
             
             return result
             
         except Exception as e:
             logging.error(f"Error analyzing subreddit {subreddit_name}: {e}")
             return {'success': False, 'error': str(e)}
-        
-    def is_powermod(self, username: str) -> bool:
-        """Check if a user is a powermod (mods 5+ subreddits)"""
-        if not self.moderators_table:
-            return False
-        
-        try:
-            all_mods = self.moderators_table.all()
-            for record in all_mods:
-                if record['fields'].get('Username', '').lower() == username.lower():
-                    return record['fields'].get('Is_Powermod', False)
-            return False
-        except:
-            return False
     
     # DEPRECATED: Keep old method for backward compatibility
     def calculate_effectiveness(self, avg_posts_per_day: float, avg_score_per_post: float,
@@ -1545,101 +1400,6 @@ class RedditAnalyzer:
                 'error': str(e)
             }
     
-    
-    def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
-        """Fetch moderators with proper error handling"""
-        try:
-            refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
-            if not refresh_token:
-                return {
-                    'success': False,
-                    'error': 'No Reddit authentication available',
-                    'requires_auth': True
-                }
-            
-            original_reddit = self.reddit
-            
-            try:
-                # Use authenticated instance
-                self.reddit = self.reddit_auth
-                
-                # Test authentication
-                try:
-                    me = self.enhanced_safe_reddit_call(lambda: self.reddit.user.me())
-                    logging.info(f"✅ Authenticated as: {me.name}")
-                except Exception as e:
-                    if "401" in str(e) or "403" in str(e):
-                        return {
-                            'success': False,
-                            'error': 'Reddit token expired or invalid. Please generate new refresh token.',
-                            'error_type': 'token_expired',
-                            'requires_new_token': True
-                        }
-                    else:
-                        raise
-                
-                # Get subreddit and moderators
-                subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
-                mod_list = self.enhanced_safe_reddit_call(lambda: list(subreddit.moderator()))
-                
-                moderators = []
-                for moderator in mod_list:
-                    try:
-                        mod_info = {
-                            'username': moderator.name,
-                            'mod_permissions': list(getattr(moderator, 'mod_permissions', ['all'])),
-                            'link_karma': getattr(moderator, 'link_karma', 0),
-                            'comment_karma': getattr(moderator, 'comment_karma', 0),
-                        }
-                        
-                        if hasattr(moderator, 'created_utc'):
-                            mod_info['account_age_days'] = (
-                                datetime.utcnow() - datetime.utcfromtimestamp(moderator.created_utc)
-                            ).days
-                        
-                        moderators.append(mod_info)
-                    except Exception as e:
-                        logging.warning(f"Error processing moderator: {e}")
-                        continue
-                
-                if moderators:
-                    self.save_moderators_to_airtable(subreddit_name, moderators)
-                
-                return {
-                    'success': True,
-                    'subreddit': subreddit_name,
-                    'moderator_count': len(moderators),
-                    'moderators': moderators
-                }
-                
-            finally:
-                self.reddit = original_reddit
-                
-        except Exception as e:
-            error_str = str(e).lower()
-            if "403" in error_str:
-                if "private" in error_str or "moderator list" in error_str:
-                    return {
-                        'success': False,
-                        'error': f'r/{subreddit_name} moderator list is private (harassment prevention)',
-                        'error_type': 'private_mod_list',
-                        'is_expected': True
-                    }
-                else:
-                    return {
-                        'success': False,
-                        'error': 'Access denied - token may need more scopes or be expired',
-                        'error_type': 'access_denied'
-                    }
-            elif "404" in error_str:
-                return {
-                    'success': False,
-                    'error': f'Subreddit r/{subreddit_name} not found',
-                    'error_type': 'not_found'
-                }
-            else:
-                return {'success': False, 'error': str(e)}
-
     def analyze_subreddit_with_timing(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """FAST subreddit analysis with enhanced realistic scoring"""
         try:
@@ -1689,173 +1449,6 @@ class RedditAnalyzer:
             
         except Exception as e:
             logging.error(f"Error in enhanced analysis: {e}")
-            return {'success': False, 'error': str(e)}
-        
-
-    def save_moderators_to_airtable(self, subreddit_name: str, moderators: List[Dict]) -> bool:
-        """Save moderators to Airtable and track cross-moderation"""
-        if not self.airtable or not self.moderators_table:
-            logging.warning("Airtable or moderators_table not available")
-            return False
-        
-        try:
-            # Get the subreddit record ID from Karma Requirements table
-            subreddit_record = self.get_existing_record(subreddit_name)
-            logging.info(f"Looking for subreddit record for: {subreddit_name}")
-            
-            if not subreddit_record:
-                logging.info(f"No existing record found, creating new record for {subreddit_name}")
-                # Create a basic record for this subreddit if it doesn't exist
-                try:
-                    subreddit_record = self.karma_table.create({
-                        'Subreddit': self.normalize_subreddit_name(subreddit_name),
-                        'Display_Name': subreddit_name,
-                        'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d')
-                    })
-                    logging.info(f"Created new record with ID: {subreddit_record['id']}")
-                except Exception as create_error:
-                    logging.error(f"Failed to create subreddit record: {create_error}")
-                    return False
-            else:
-                logging.info(f"Found existing record with ID: {subreddit_record['id']}")
-            
-            subreddit_record_id = subreddit_record['id']
-            logging.info(f"Processing {len(moderators)} moderators for subreddit record ID: {subreddit_record_id}")
-            
-            # Continue with the rest of your moderator processing...
-            for mod in moderators:
-                try:
-                    # Check if moderator already exists
-                    existing_mod = None
-                    all_mods = self.moderators_table.all()
-                    for record in all_mods:
-                        if record['fields'].get('Username', '').lower() == mod['username'].lower():
-                            existing_mod = record
-                            break
-                    
-                    mod_data = {
-                        'Username': mod['username'],
-                        'Link_Karma': mod.get('link_karma', 0),
-                        'Comment_Karma': mod.get('comment_karma', 0),
-                        'Account_Age_Days': mod.get('account_age_days', 0),
-                        'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d'),
-                        'Is_Employee': mod.get('is_employee', False),
-                        'Has_Gold': mod.get('is_gold', False)
-                    }
-                    
-                    if existing_mod:
-                        logging.info(f"Updating existing moderator: {mod['username']}")
-                        # Update existing moderator
-                        existing_subs = existing_mod['fields'].get('Subreddits_Moderated', [])
-                        if subreddit_record_id not in existing_subs:
-                            existing_subs.append(subreddit_record_id)
-                        
-                        mod_data['Subreddits_Moderated'] = existing_subs
-                        mod_data['Total_Subreddits'] = len(existing_subs)
-                        mod_data['Is_Powermod'] = len(existing_subs) >= 5
-                        
-                        # Update permissions JSON
-                        existing_perms = existing_mod['fields'].get('Permissions', '{}')
-                        try:
-                            perms_dict = json.loads(existing_perms) if existing_perms else {}
-                        except:
-                            perms_dict = {}
-                        perms_dict[subreddit_name] = mod.get('mod_permissions', ['all'])
-                        mod_data['Permissions'] = json.dumps(perms_dict)
-                        
-                        self.moderators_table.update(existing_mod['id'], mod_data)
-                    else:
-                        logging.info(f"Creating new moderator: {mod['username']}")
-                        # Create new moderator record
-                        mod_data['Subreddits_Moderated'] = [subreddit_record_id]
-                        mod_data['Total_Subreddits'] = 1
-                        mod_data['Is_Powermod'] = False
-                        mod_data['Permissions'] = json.dumps({
-                            subreddit_name: mod.get('mod_permissions', ['all'])
-                        })
-                        
-                        self.moderators_table.create(mod_data)
-                        
-                except Exception as e:
-                    logging.error(f"Error saving moderator {mod.get('username')}: {e}")
-                    continue
-            
-            # Update the subreddit record (with better error handling)
-            logging.info(f"Attempting to update subreddit record {subreddit_record_id}")
-            try:
-                update_data = {'Last_Updated': datetime.utcnow().strftime('%Y-%m-%d')}
-                
-                # Try to add moderator count if field exists
-                try:
-                    # First try with all fields
-                    test_data = {
-                        'Moderator_Count': len(moderators),
-                        'Moderators_Checked': True,
-                        'Moderators_Check_Date': datetime.utcnow().strftime('%Y-%m-%d')
-                    }
-                    self.karma_table.update(subreddit_record_id, test_data)
-                    logging.info("Successfully updated with all moderator fields")
-                except Exception as field_error:
-                    logging.warning(f"Moderator fields don't exist, using basic update: {field_error}")
-                    self.karma_table.update(subreddit_record_id, update_data)
-                    logging.info("Successfully updated with basic fields")
-                    
-            except Exception as update_error:
-                logging.error(f"Failed to update subreddit record: {update_error}")
-                return False
-            
-            logging.info(f"Successfully saved {len(moderators)} moderators for {subreddit_name}")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Failed to save moderators to Airtable: {e}")
-            return False
-
-    def find_shared_moderators(self, subreddit_names: List[str]) -> Dict[str, Any]:
-        """Find moderators that moderate multiple specified subreddits"""
-        if not self.moderators_table:
-            return {'success': False, 'error': 'Moderators table not available'}
-        
-        try:
-            all_mods = self.moderators_table.all()
-            shared_mods = []
-            
-            # Normalize subreddit names for comparison
-            normalized_subs = [self.normalize_subreddit_name(s) for s in subreddit_names]
-            
-            for mod_record in all_mods:
-                mod_fields = mod_record['fields']
-                
-                # Get subreddits this mod moderates
-                mod_subs = []
-                if 'Subreddits_Moderated' in mod_fields:
-                    # Get the linked subreddit records
-                    for sub_id in mod_fields['Subreddits_Moderated']:
-                        try:
-                            sub_record = self.karma_table.get(sub_id)
-                            sub_name = sub_record['fields'].get('Subreddit', '').lower()
-                            if sub_name in normalized_subs:
-                                mod_subs.append(sub_name)
-                        except:
-                            continue
-                
-                # If this mod moderates 2+ of our target subreddits
-                if len(mod_subs) >= 2:
-                    shared_mods.append({
-                        'username': mod_fields.get('Username'),
-                        'subreddits_in_common': mod_subs,
-                        'total_subreddits': mod_fields.get('Total_Subreddits', 0),
-                        'is_powermod': mod_fields.get('Is_Powermod', False)
-                    })
-            
-            return {
-                'success': True,
-                'shared_moderators': shared_mods,
-                'total_shared': len(shared_mods)
-            }
-            
-        except Exception as e:
-            logging.error(f"Error finding shared moderators: {e}")
             return {'success': False, 'error': str(e)}
     
     def analyze_subreddit(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
@@ -2288,21 +1881,8 @@ class RedditAnalyzer:
                                 'avg_discovered_score': sub_data.get('avg_discovered_score', 0),
                                 'analysis_depth': 'full' if task_number <= 20 else 'quick'
                             }
-
-                            # Fetch and save moderators for discovered subreddits
-                            try:
-                                mod_result = self.get_subreddit_moderators(sub_data['display_name'])
-                                if mod_result.get('success'):
-                                    record_data['moderator_count'] = mod_result['moderator_count']
-                                    record_data['has_powermods'] = any(
-                                        self.is_powermod(m['username']) 
-                                        for m in mod_result['moderators']
-                                    )
-                            except:
-                                pass
                             
                             results['discovered_subreddits'].append(record_data)
-                            
                             
                             # Save to Airtable in background (non-blocking)
                             if self.airtable:
@@ -2384,8 +1964,6 @@ class RedditAnalyzer:
         cleaned = re.sub(r'\s+', ' ', input_text.strip())
         subreddits = re.split(r'[,\s]+', cleaned)
         return [sub.strip() for sub in subreddits if sub.strip()]
-    
-    
     
     async def analyze_multiple_concurrent(self, subreddits: list, days: int = 7):
         """Analyze multiple subreddits concurrently"""
@@ -3065,28 +2643,6 @@ def analyze_flairs():
                 'success': False,
                 'error': f'Analysis failed: {error_message}'
             }), 500
-        
-        
-@app.route('/moderators', methods=['POST'])
-def get_moderators_endpoint():
-    """Get moderators for a subreddit"""
-    data = request.json
-    subreddit_name = data.get('subreddit')
-    
-    if not subreddit_name:
-        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
-    
-    # Validate subreddit exists
-    validation = validate_subreddit(subreddit_name)
-    if not validation['valid']:
-        return jsonify({
-            'success': False,
-            'error': validation['message'],
-            'error_type': validation['error']
-        }), 400
-    
-    result = analyzer.get_subreddit_moderators(subreddit_name)
-    return jsonify(result)      
         
 
 @app.route('/discover', methods=['POST'])
