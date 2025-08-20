@@ -29,6 +29,7 @@ REDDIT_USER_AGENT = os.getenv('REDDIT_USER_AGENT', 'RedditAnalyzer/1.0')
 
 class RedditAnalyzer:
     def __init__(self):
+        self.pool_size = 5
         self.airtable = None
         self.reddit = self._create_reddit_instance(use_auth=False)  # Read-only for general operations
         self.reddit_auth = self._create_reddit_instance(use_auth=True)  # Authenticated for mod operations
@@ -63,10 +64,9 @@ class RedditAnalyzer:
         
         # Enhanced connection pool management
         self.reddit_pool = []
-        for i in range(self.pool_size):
-            reddit_instance = self._create_reddit_instance(use_auth=False)  # Read-only
+        for i in range(self.pool_size):  # ✅ Now pool_size exists
+            reddit_instance = self._create_reddit_instance(use_auth=False)
             self.reddit_pool.append(reddit_instance)
-        self.pool_size = 5
         self.pool_lock = threading.Lock()
         self.pool_last_used = {}  # Track when each connection was last used
         self.pool_creation_time = {}  # Track when each connection was created
@@ -78,16 +78,6 @@ class RedditAnalyzer:
         
         # Add request semaphore to limit concurrent requests
         self.request_semaphore = Semaphore(5)  # Max 5 concurrent Reddit requests
-        
-        # Initialize main Reddit instance
-        self.reddit = self._create_reddit_instance()
-        
-        # Initialize Reddit connection pool with tracking
-        for i in range(self.pool_size):
-            reddit_instance = self._create_reddit_instance()
-            self.reddit_pool.append(reddit_instance)
-            self.pool_last_used[i] = time.time()
-            self.pool_creation_time[i] = time.time()
         
         # Cache for analysis results
         self.analysis_cache = {}
