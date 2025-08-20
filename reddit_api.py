@@ -1547,183 +1547,98 @@ class RedditAnalyzer:
     
     
     def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
-        """Fetch moderators for a subreddit with proper authentication and fallbacks"""
+        """Fetch moderators with proper error handling"""
         try:
-            # Check if we have authentication available
             refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
             if not refresh_token:
                 return {
                     'success': False,
-                    'error': 'No Reddit refresh token available. Authentication required for moderator access.',
+                    'error': 'No Reddit authentication available',
                     'requires_auth': True
                 }
             
-            # Store original reddit instance
             original_reddit = self.reddit
             
             try:
-                # Switch to authenticated instance
+                # Use authenticated instance
                 self.reddit = self.reddit_auth
                 
-                # CRITICAL: Test FULL authentication, not just token existence
+                # Test authentication
                 try:
                     me = self.enhanced_safe_reddit_call(lambda: self.reddit.user.me())
-                    if not me or not hasattr(me, 'name'):
-                        return {
-                            'success': False,
-                            'error': 'Reddit authentication failed. Token may be expired or invalid.',
-                            'requires_auth': True
-                        }
-                    logging.info(f"✅ Authenticated as Reddit user: {me.name}")
+                    logging.info(f"✅ Authenticated as: {me.name}")
                 except Exception as e:
-                    # Check if it's a scope issue
-                    if "403" in str(e) or "insufficient_scope" in str(e).lower():
+                    if "401" in str(e) or "403" in str(e):
                         return {
                             'success': False,
-                            'error': 'Reddit app lacks required scopes. Need "read" scope for moderator access.',
-                            'error_type': 'insufficient_scope',
-                            'requires_reauth': True
+                            'error': 'Reddit token expired or invalid. Please generate new refresh token.',
+                            'error_type': 'token_expired',
+                            'requires_new_token': True
                         }
                     else:
-                        return {
-                            'success': False,
-                            'error': f'Reddit authentication test failed: {str(e)}',
-                            'requires_auth': True
-                        }
+                        raise
                 
-                # Now try to get the subreddit
+                # Get subreddit and moderators
                 subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
+                mod_list = self.enhanced_safe_reddit_call(lambda: list(subreddit.moderator()))
                 
-                # Try MODERN API endpoint first (better success rate)
-                try:
-                    # Use the newer endpoint that doesn't require special permissions
-                    response = self.enhanced_safe_reddit_call(
-                        lambda: self.reddit.get(f'/api/v1/{subreddit_name}/moderators')
-                    )
-                    
-                    moderators = []
-                    for mod_data in response:
-                        try:
-                            mod_info = {
-                                'username': mod_data.name,
-                                'mod_permissions': list(getattr(mod_data, 'mod_permissions', ['all'])),
-                                'link_karma': getattr(mod_data, 'link_karma', 0),
-                                'comment_karma': getattr(mod_data, 'comment_karma', 0),
-                            }
-                            
-                            if hasattr(mod_data, 'created_utc'):
-                                mod_info['account_age_days'] = (
-                                    datetime.utcnow() - datetime.utcfromtimestamp(mod_data.created_utc)
-                                ).days
-                            
-                            moderators.append(mod_info)
-                        except Exception as e:
-                            logging.warning(f"Error processing moderator: {e}")
-                            continue
-                    
-                    # Success with modern endpoint
-                    if moderators:
-                        self.save_moderators_to_airtable(subreddit_name, moderators)
-                    
-                    return {
-                        'success': True,
-                        'subreddit': subreddit_name,
-                        'moderator_count': len(moderators),
-                        'moderators': moderators,
-                        'method': 'modern_api'
-                    }
-                    
-                except Exception as modern_error:
-                    logging.info(f"Modern API failed, trying legacy: {modern_error}")
-                    
-                    # Fallback to legacy endpoint
+                moderators = []
+                for moderator in mod_list:
                     try:
-                        mod_list = self.enhanced_safe_reddit_call(lambda: list(subreddit.moderator()))
-                        
-                        moderators = []
-                        for moderator in mod_list:
-                            try:
-                                mod_info = {
-                                    'username': moderator.name,
-                                    'mod_permissions': list(getattr(moderator, 'mod_permissions', ['all'])),
-                                    'link_karma': getattr(moderator, 'link_karma', 0),
-                                    'comment_karma': getattr(moderator, 'comment_karma', 0),
-                                }
-                                
-                                if hasattr(moderator, 'created_utc'):
-                                    mod_info['account_age_days'] = (
-                                        datetime.utcnow() - datetime.utcfromtimestamp(moderator.created_utc)
-                                    ).days
-                                
-                                moderators.append(mod_info)
-                            except Exception as e:
-                                logging.warning(f"Error processing moderator {moderator}: {e}")
-                                continue
-                        
-                        # Success with legacy endpoint
-                        if moderators:
-                            self.save_moderators_to_airtable(subreddit_name, moderators)
-                        
-                        return {
-                            'success': True,
-                            'subreddit': subreddit_name,
-                            'moderator_count': len(moderators),
-                            'moderators': moderators,
-                            'method': 'legacy_api'
+                        mod_info = {
+                            'username': moderator.name,
+                            'mod_permissions': list(getattr(moderator, 'mod_permissions', ['all'])),
+                            'link_karma': getattr(moderator, 'link_karma', 0),
+                            'comment_karma': getattr(moderator, 'comment_karma', 0),
                         }
                         
-                    except Exception as legacy_error:
-                        # Handle specific 403 errors with helpful messages
-                        if "403" in str(legacy_error):
-                            # Check if user is banned from subreddit
-                            try:
-                                # Test if we can access the subreddit at all
-                                _ = subreddit.subscribers
-                                
-                                return {
-                                    'success': False,
-                                    'error': f'r/{subreddit_name} moderator list is private (common for harassment prevention)',
-                                    'error_type': 'private_mod_list',
-                                    'is_expected': True,
-                                    'suggestion': 'This is normal behavior - many subreddits hide moderator lists'
-                                }
-                            except:
-                                return {
-                                    'success': False,
-                                    'error': f'Access denied to r/{subreddit_name}. You may be banned from this subreddit.',
-                                    'error_type': 'banned_from_subreddit'
-                                }
-                        else:
-                            raise legacy_error
-                            
+                        if hasattr(moderator, 'created_utc'):
+                            mod_info['account_age_days'] = (
+                                datetime.utcnow() - datetime.utcfromtimestamp(moderator.created_utc)
+                            ).days
+                        
+                        moderators.append(mod_info)
+                    except Exception as e:
+                        logging.warning(f"Error processing moderator: {e}")
+                        continue
+                
+                if moderators:
+                    self.save_moderators_to_airtable(subreddit_name, moderators)
+                
+                return {
+                    'success': True,
+                    'subreddit': subreddit_name,
+                    'moderator_count': len(moderators),
+                    'moderators': moderators
+                }
+                
             finally:
-                # Always restore original reddit instance
                 self.reddit = original_reddit
                 
         except Exception as e:
-            logging.error(f"Error fetching moderators for {subreddit_name}: {e}")
-            
-            # Provide helpful error categorization
             error_str = str(e).lower()
-            if "403" in error_str or "forbidden" in error_str:
-                return {
-                    'success': False,
-                    'error': 'Access denied. Either moderator list is private or authentication insufficient.',
-                    'error_type': 'access_denied',
-                    'is_expected': True
-                }
-            elif "404" in error_str or "not found" in error_str:
+            if "403" in error_str:
+                if "private" in error_str or "moderator list" in error_str:
+                    return {
+                        'success': False,
+                        'error': f'r/{subreddit_name} moderator list is private (harassment prevention)',
+                        'error_type': 'private_mod_list',
+                        'is_expected': True
+                    }
+                else:
+                    return {
+                        'success': False,
+                        'error': 'Access denied - token may need more scopes or be expired',
+                        'error_type': 'access_denied'
+                    }
+            elif "404" in error_str:
                 return {
                     'success': False,
                     'error': f'Subreddit r/{subreddit_name} not found',
                     'error_type': 'not_found'
                 }
             else:
-                return {
-                    'success': False, 
-                    'error': str(e),
-                    'error_type': 'unknown'
-                }
+                return {'success': False, 'error': str(e)}
 
     def analyze_subreddit_with_timing(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """FAST subreddit analysis with enhanced realistic scoring"""
