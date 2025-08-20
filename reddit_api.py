@@ -645,24 +645,7 @@ class RedditAnalyzer:
                 if post_count % 100 == 0:
                     time.sleep(2)
                     logging.info(f"Processed {post_count} posts for r/{subreddit_name}")
-            
-            # Add moderator fetching (after line 650)
-            try:
-                mod_result = self.get_subreddit_moderators(subreddit_name)
-                if mod_result.get('success'):
-                    result['moderators'] = mod_result['moderators'][:10]  # Top 10
-                    result['moderator_count'] = mod_result['moderator_count']
-                    
-                    # Check for powermods
-                    powermods = [m for m in mod_result['moderators'] 
-                            if self.is_powermod(m['username'])]
-                    if powermods:
-                        result['has_powermods'] = True
-                        result['powermod_count'] = len(powermods)
-            except Exception as e:
-                logging.warning(f"Could not fetch moderators: {e}")
-                result['moderators'] = []
-                result['moderator_count'] = 0
+
 
             # Also check top posts to ensure we get the actual top post
             try:
@@ -756,6 +739,24 @@ class RedditAnalyzer:
                 'reach_description': reach_description,
                 'has_high_variance': has_high_variance
             }
+
+            # Add moderator fetching (after line 650)
+            try:
+                mod_result = self.get_subreddit_moderators(subreddit_name)
+                if mod_result.get('success'):
+                    result['moderators'] = mod_result['moderators'][:10]  # Top 10
+                    result['moderator_count'] = mod_result['moderator_count']
+                    
+                    # Check for powermods
+                    powermods = [m for m in mod_result['moderators'] 
+                            if self.is_powermod(m['username'])]
+                    if powermods:
+                        result['has_powermods'] = True
+                        result['powermod_count'] = len(powermods)
+            except Exception as e:
+                logging.warning(f"Could not fetch moderators: {e}")
+                result['moderators'] = []
+                result['moderator_count'] = 0            
             
             return result
             
