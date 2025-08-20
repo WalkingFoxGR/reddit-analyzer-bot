@@ -33,13 +33,6 @@ class RedditAnalyzer:
         api_key = os.getenv('AIRTABLE_API_KEY')
         base_id = os.getenv('AIRTABLE_BASE_ID')
         
-        # ADD THIS DEBUG LOGGING
-        refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
-        if refresh_token:
-            logging.info(f"Refresh token found: {refresh_token[:10]}...")
-        else:
-            logging.error("NO REFRESH TOKEN FOUND IN ENVIRONMENT!")
-        
         if api_key and base_id:
             try:
                 self.airtable = Api(api_key)
@@ -103,34 +96,17 @@ class RedditAnalyzer:
         return name.lower().strip()
 
     def _create_reddit_instance(self):
-        """Create Reddit instance with refresh token if available"""
-        refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
-        
-        # Log what we're doing
-        if refresh_token:
-            logging.info("Creating authenticated Reddit instance with refresh token")
-            return praw.Reddit(
-                client_id=REDDIT_CLIENT_ID,
-                client_secret=REDDIT_CLIENT_SECRET,
-                user_agent=REDDIT_USER_AGENT,
-                refresh_token=refresh_token,  # THIS IS THE KEY LINE
-                ratelimit_seconds=300,
-                timeout=30,
-                connection_pool_size=5,
-                max_retries=2
-            )
-        else:
-            logging.warning("Creating read-only Reddit instance (no refresh token)")
-            return praw.Reddit(
-                client_id=REDDIT_CLIENT_ID,
-                client_secret=REDDIT_CLIENT_SECRET,
-                user_agent=REDDIT_USER_AGENT,
-                ratelimit_seconds=300,
-                timeout=30,
-                connection_pool_size=5,
-                max_retries=2
-            )
-        
+        """Create a fresh Reddit instance"""
+        return praw.Reddit(
+            client_id=REDDIT_CLIENT_ID,
+            client_secret=REDDIT_CLIENT_SECRET,
+            user_agent=REDDIT_USER_AGENT,
+            ratelimit_seconds=300,
+            timeout=30,
+            connection_pool_size=5,  # Reduced from 10
+            max_retries=2  # Reduced from 3
+        )
+    
     def test_connection(self):
         """Test Reddit connection on initialization"""
         try:
@@ -301,57 +277,6 @@ class RedditAnalyzer:
         except Exception:
             # If we can't determine, assume regular subreddit
             return False
-        
-
-    def list_moderators(self, subreddit_name: str) -> Dict[str, Any]:
-        """Return subreddit moderators with permissions and join dates (if available)"""
-        try:
-            sub = self.enhanced_safe_reddit_call(
-                lambda: self.reddit.subreddit(subreddit_name)
-            )
-
-            moderators = []
-            # PRAW returns Redditor models with 'mod_permissions' and often 'date'
-            for rel in sub.moderator():
-                try:
-                    name = rel.name
-                    perms = list(getattr(rel, "mod_permissions", []) or [])
-                    joined_ts = getattr(rel, "date", None)
-                    joined_iso = None
-                    if joined_ts:
-                        try:
-                            joined_iso = datetime.utcfromtimestamp(
-                                joined_ts
-                            ).isoformat()
-                        except Exception:
-                            joined_iso = None
-
-                    moderators.append(
-                        {
-                            "username": name,
-                            "permissions": perms,
-                            "has_full_perms": "all" in perms or "config" in perms,
-                            "joined_utc": joined_iso,
-                        }
-                    )
-                except Exception:
-                    continue
-
-            # Sort: full-perms first, then alphabetically
-            moderators.sort(
-                key=lambda m: (not m["has_full_perms"], m["username"].lower())
-            )
-
-            return {
-                "success": True,
-                "subreddit": sub.display_name,
-                "count": len(moderators),
-                "moderators": moderators,
-                "modmail_url": f"https://www.reddit.com/message/compose?to=%2Fr%2F{sub.display_name}",
-            }
-        except Exception as e:
-            logging.error(f"Error listing moderators for {subreddit_name}: {e}")
-            return {"success": False, "error": str(e)}
 
     def analyze_post_consistency(self, post_scores: List[int], is_nsfw: bool = False) -> Dict[str, Any]:
         """Analyze consistency of post performance"""
@@ -1475,70 +1400,6 @@ class RedditAnalyzer:
                 'error': str(e)
             }
     
-    
-    def get_subreddit_moderators(self, subreddit_name: str) -> Dict[str, Any]:
-        """Fetch moderators for a subreddit (requires authentication)"""
-        try:
-            # Better authentication check
-            refresh_token = os.getenv('REDDIT_REFRESH_TOKEN')
-            if not refresh_token:
-                return {
-                    'success': False,
-                    'error': 'Bot not authenticated. Cannot fetch moderators without Reddit login.'
-                }
-            
-            # Test if we can actually authenticate
-            try:
-                # This will fail if not properly authenticated
-                me = self.enhanced_safe_reddit_call(lambda: self.reddit.user.me())
-                if me:
-                    logging.info(f"Authenticated as Reddit user: {me.name}")
-            except Exception as e:
-                logging.error(f"Authentication test failed: {e}")
-                return {
-                    'success': False,
-                    'error': f'Authentication failed: {str(e)}'
-                }
-            
-            # Now try to get the subreddit
-            subreddit = self.enhanced_safe_reddit_call(lambda: self.reddit.subreddit(subreddit_name))
-            
-            moderators = []
-            
-            # Get moderator list
-            mod_list = self.enhanced_safe_reddit_call(lambda: list(subreddit.moderator()))
-            
-            for moderator in mod_list:
-                try:
-                    mod_info = {
-                        'username': moderator.name,
-                        'mod_permissions': list(moderator.mod_permissions) if hasattr(moderator, 'mod_permissions') else ['all'],
-                    }
-                    
-                    # Get additional info
-                    mod_info['link_karma'] = getattr(moderator, 'link_karma', 0)
-                    mod_info['comment_karma'] = getattr(moderator, 'comment_karma', 0)
-                    
-                    if hasattr(moderator, 'created_utc'):
-                        mod_info['account_age_days'] = (datetime.utcnow() - datetime.utcfromtimestamp(moderator.created_utc)).days
-                    
-                    moderators.append(mod_info)
-                    
-                except Exception as e:
-                    logging.warning(f"Error processing moderator {moderator}: {e}")
-                    continue
-            
-            return {
-                'success': True,
-                'subreddit': subreddit_name,
-                'moderator_count': len(moderators),
-                'moderators': moderators
-            }
-            
-        except Exception as e:
-            logging.error(f"Error fetching moderators for {subreddit_name}: {e}")
-            return {'success': False, 'error': str(e)}
-
     def analyze_subreddit_with_timing(self, subreddit_name: str, days: int = 7) -> Dict[str, Any]:
         """FAST subreddit analysis with enhanced realistic scoring"""
         try:
@@ -2103,8 +1964,6 @@ class RedditAnalyzer:
         cleaned = re.sub(r'\s+', ' ', input_text.strip())
         subreddits = re.split(r'[,\s]+', cleaned)
         return [sub.strip() for sub in subreddits if sub.strip()]
-    
-    
     
     async def analyze_multiple_concurrent(self, subreddits: list, days: int = 7):
         """Analyze multiple subreddits concurrently"""
@@ -2784,28 +2643,6 @@ def analyze_flairs():
                 'success': False,
                 'error': f'Analysis failed: {error_message}'
             }), 500
-        
-        
-@app.route('/moderators', methods=['POST'])
-def get_moderators_endpoint():
-    """Get moderators for a subreddit"""
-    data = request.json
-    subreddit_name = data.get('subreddit')
-    
-    if not subreddit_name:
-        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
-    
-    # Validate subreddit exists
-    validation = validate_subreddit(subreddit_name)
-    if not validation['valid']:
-        return jsonify({
-            'success': False,
-            'error': validation['message'],
-            'error_type': validation['error']
-        }), 400
-    
-    result = analyzer.get_subreddit_moderators(subreddit_name)
-    return jsonify(result)      
         
 
 @app.route('/discover', methods=['POST'])
