@@ -1922,36 +1922,119 @@ class RedditAnalyzer:
             return {'success': False, 'error': str(e)}
 
     def save_discovered_to_airtable(self, discovery_data: Dict[str, Any]) -> bool:
-        """Save discovered subreddit to Airtable"""
+        """Enhanced save discovered subreddit to Airtable with full analysis data"""
         if not self.airtable:
             return False
             
         try:
             normalized_name = discovery_data['normalized_name']
+            display_name = discovery_data['display_name']
             
-            # Check if already exists (using Python filtering)
+            # Check if already exists
             existing_record = self.get_existing_record(normalized_name)
+            current_date = datetime.utcnow().strftime('%Y-%m-%d')
             
+            # Build comprehensive record matching save_analyze_to_airtable
             record_data = {
                 'Subreddit': normalized_name,
-                'Display_Name': discovery_data['display_name'],
-                'Is_NSFW': discovery_data['is_nsfw'],
-                'Tag': discovery_data.get('tag', 'Unknown'),
+                'Display_Name': display_name,
+                'Subscribers': discovery_data.get('subscribers', 0),
+                'Effectiveness_Score': discovery_data.get('effectiveness_score', 0),
+                'Avg_Posts_Per_Day': discovery_data.get('avg_posts_per_day', 0),
+                'Avg_Score_Per_Post': discovery_data.get('avg_score_per_post', 0),
+                'Median_Score_Per_Post': discovery_data.get('median_score', 0),
+                'Trimmed_Mean_Score': discovery_data.get('trimmed_mean_score', 0),
+                'Avg_Comments_Per_Post': discovery_data.get('avg_comments', 0),
+                'Days_Analyzed': discovery_data.get('days_analyzed', 7),
+                'Is_NSFW': discovery_data.get('is_nsfw', False),
+                'Posts_Analyzed_For_Scoring': discovery_data.get('posts_analyzed_for_scoring', 0),
+                'Scoring_Version': 'v2_realistic',
+                'Last_Analyzed': current_date,
+                
+                # Discovery specific fields
                 'Discovered_From': discovery_data.get('discovered_from', ''),
                 'User_Overlap_Count': discovery_data.get('user_overlap_count', 0),
-                'Effectiveness_Score': discovery_data.get('effectiveness_score', 0),
-                'Subscribers': discovery_data.get('subscribers', 0),
-                'Median_Score_Per_Post': discovery_data.get('median_score', 0),
-                'Avg_Comments_Per_Post': discovery_data.get('avg_comments', 0),
-                'Discovery_Date': datetime.utcnow().strftime('%Y-%m-%d')
+                'Discovery_Date': current_date,
+                'Tag': discovery_data.get('tag', 'Unknown'),
+                
+                # High performer data
+                'High_Performers_100_Plus': discovery_data.get('high_performers', {}).get('100+', 0),
+                'High_Performers_200_Plus': discovery_data.get('high_performers', {}).get('200+', 0),
+                'High_Performers_500_Plus': discovery_data.get('high_performers', {}).get('500+', 0),
+                'High_Performer_Percentage': discovery_data.get('high_performer_percentage', 0),
+                'Reach_Description': discovery_data.get('reach_description', ''),
+                'Has_High_Variance': discovery_data.get('has_high_variance', False)
             }
             
+            # Add consistency data if available
+            if discovery_data.get('consistency_analysis'):
+                consistency = discovery_data['consistency_analysis']
+                record_data.update({
+                    'Consistency_Score': consistency.get('consistency_score', 0),
+                    'Good_Posts_Ratio': consistency.get('good_posts_ratio', 0),
+                    'Great_Posts_Ratio': consistency.get('great_posts_ratio', 0),
+                    'Distribution_Pattern': consistency.get('distribution', ''),
+                    'Good_Threshold': consistency.get('good_threshold', 0),
+                    'Great_Threshold': consistency.get('great_threshold', 0)
+                })
+            
+            # Add effectiveness breakdown if available
+            if discovery_data.get('effectiveness_breakdown'):
+                breakdown = discovery_data['effectiveness_breakdown']
+                record_data.update({
+                    'Engagement_Score': breakdown.get('engagement_score', 0),
+                    'Frequency_Score': breakdown.get('frequency_score', 0),
+                    'Consistency_Component': breakdown.get('consistency_score', 0),
+                    'Size_Modifier': breakdown.get('size_modifier', 1.0)
+                })
+            
+            # Add top post data if available
+            if discovery_data.get('top_post'):
+                top_post = discovery_data['top_post']
+                record_data.update({
+                    'Top_Post_Title': top_post.get('title', '')[:500],
+                    'Top_Post_Score': top_post.get('score', 0),
+                    'Top_Post_Author': top_post.get('author', ''),
+                    'Top_Post_Comments': top_post.get('comments', 0),
+                    'Top_Post_URL': top_post.get('url', ''),
+                    'Top_Post_Flair': top_post.get('flair', '')
+                })
+            
+            # Add posting times data if available
+            if discovery_data.get('posting_times'):
+                posting_times = discovery_data['posting_times']
+                
+                # Best hour
+                if posting_times.get('best_hours') and len(posting_times['best_hours']) > 0:
+                    best_hour = posting_times['best_hours'][0]
+                    record_data['Best_Hour'] = best_hour.get('hour', -1)
+                    record_data['Best_Hour_Score'] = best_hour.get('avg_score', 0)
+                
+                # Best day
+                if posting_times.get('best_days') and len(posting_times['best_days']) > 0:
+                    best_day = posting_times['best_days'][0]
+                    record_data['Best_Day'] = best_day.get('day', '')
+                
+                record_data['Posts_Analyzed_For_Timing'] = posting_times.get('posts_analyzed', 0)
+            
             if existing_record:
+                # Preserve karma requirements if they exist
+                existing_fields = existing_record['fields']
+                karma_fields = [
+                    'Post_Karma_Min', 'Comment_Karma_Min', 'Account_Age_Days',
+                    'Confidence', 'Requires_Verification', 'Verification_Method',
+                    'Verification_Optional', 'Verification_Note', 'Posts_Analyzed'
+                ]
+                
+                for field in karma_fields:
+                    if field in existing_fields and field not in record_data:
+                        record_data[field] = existing_fields[field]
+                
                 self.karma_table.update(existing_record['id'], record_data)
-                logging.info(f"Updated discovered subreddit: {normalized_name}")
+                logging.info(f"Updated discovered subreddit: {display_name}")
             else:
                 self.karma_table.create(record_data)
-                logging.info(f"Created new discovered subreddit: {normalized_name}")
+                logging.info(f"Created new discovered subreddit: {display_name}")
                 
             return True
             
