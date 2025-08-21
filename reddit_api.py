@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Set, Tuple
 import logging
 import time
 import re
-from collections import defaultdict, Counter
+from collections import defaultdict, deque, Counter
 import threading
 import queue
 import pytz
@@ -57,8 +57,11 @@ class RedditAnalyzer:
         self.max_idle_time = 600       # 5 minutes instead of 1
         
         # Add request semaphore to limit concurrent requests
-        self.request_semaphore = Semaphore(5)  # Max 5 concurrent Reddit requests
-        
+        # 🎯 PRODUCTION RATE LIMITING
+        self.max_qpm = 95  # 95% of 100 QPM for safety
+        self.request_window = 60  # 1 minute window
+        self.request_times = deque()
+        self.rate_lock = threading.Lock()        
         # Initialize main Reddit instance
         self.reddit = self._create_reddit_instance()
         
@@ -173,7 +176,23 @@ class RedditAnalyzer:
             raise
     
     def enhanced_safe_reddit_call(self, func, max_retries=3, backoff_base=2):
-        """Enhanced wrapper with better error handling"""
+        """Production-grade wrapper with global rate limiting"""
+        
+        # Rate limiting check
+        with self.rate_lock:
+            now = time.time()
+            # Remove old requests (60-second window)
+            while self.request_times and now - self.request_times[0] > 60:
+                self.request_times.popleft()
+            
+            # Check if we're over limit
+            if len(self.request_times) >= self.max_qpm:
+                wait_time = 60 - (now - self.request_times[0])
+                time.sleep(max(wait_time, 1))
+            
+            # Record this request
+            self.request_times.append(now)
+        
         with self.request_semaphore:
             last_exception = None
             
@@ -200,14 +219,14 @@ class RedditAnalyzer:
                     logging.warning(f"Response exception on attempt {attempt + 1}: {e}")
                     last_exception = e
                     
-                    # DON'T RETRY 404 ERRORS - they mean the resource doesn't exist
+                    # DON'T RETRY 404 ERRORS
                     if hasattr(e, 'response') and e.response:
                         if e.response.status_code == 404:
                             logging.error(f"404 Not Found - not retrying: {e}")
-                            raise  # Don't retry, just raise immediately
+                            raise
                         elif "Redirect" in str(e):
                             logging.error(f"Redirect error - resource doesn't exist: {e}")
-                            raise  # Don't retry redirects either
+                            raise
                     
                     # Only retry server errors (5xx)
                     if hasattr(e, 'response') and e.response and e.response.status_code >= 500:
@@ -229,7 +248,7 @@ class RedditAnalyzer:
                             time.sleep(wait_time)
                         elif e.response.status_code == 404:
                             logging.error(f"404 Not Found - not retrying: {e}")
-                            raise  # Don't retry 404s
+                            raise
                     continue
                     
                 except Exception as e:
