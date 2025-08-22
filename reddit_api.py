@@ -2759,6 +2759,19 @@ def discover_endpoint():
     
     return jsonify(result)    
 
+@app.route('/stripe-webhook', methods=['POST'])
+async def stripe_webhook():
+    """Handle Stripe webhooks"""
+    payload = request.get_data(as_text=True)
+    sig_header = request.headers.get('Stripe-Signature')
+    
+    result = await payment_processor.handle_webhook(payload, sig_header)
+    
+    if result['success']:
+        return jsonify({'received': True}), 200
+    else:
+        return jsonify({'error': result.get('error', 'Unknown error')}), 400
+
 # Helper method to clean up old cache entries periodically
 def cleanup_cache():
     """Remove expired cache entries"""
