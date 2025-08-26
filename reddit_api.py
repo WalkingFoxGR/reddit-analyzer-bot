@@ -53,8 +53,8 @@ class RedditAnalyzer:
         self.request_count = 0
         self.last_reset = time.time()
         # Less aggressive connection management
-        self.max_connection_age = 1800  # 10 minutes instead of 5
-        self.max_idle_time = 600       # 5 minutes instead of 1
+        self.max_connection_age = 300  # 10 minutes instead of 5
+        self.max_idle_time = 60    # 5 minutes instead of 1
         
         # Add request semaphore to limit concurrent requests
         self.request_semaphore = Semaphore(5)  # Max 5 concurrent Reddit requests
@@ -64,8 +64,7 @@ class RedditAnalyzer:
         
         # Initialize Reddit connection pool with tracking
         for i in range(self.pool_size):
-            reddit_instance = self._create_reddit_instance()
-            self.reddit_pool.append(reddit_instance)
+            self.reddit_pool[i] = self._create_reddit_instance()
             self.pool_last_used[i] = time.time()
             self.pool_creation_time[i] = time.time()
         
