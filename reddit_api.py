@@ -64,7 +64,7 @@ class RedditAnalyzer:
         
         # Initialize Reddit connection pool with tracking
         for i in range(self.pool_size):
-            self.reddit_pool[i] = self._create_reddit_instance()
+            self.reddit_pool[i] = self._create_reddit_instance())
             self.pool_last_used[i] = time.time()
             self.pool_creation_time[i] = time.time()
         
