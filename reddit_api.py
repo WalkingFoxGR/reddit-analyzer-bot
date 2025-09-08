@@ -1608,24 +1608,91 @@ class RedditAnalyzer:
             return {'success': False, 'error': str(e)}
     
 
+    def get_all_analyzed_subreddits(self) -> Set[str]:
+        """Get set of all subreddits already in Airtable"""
+        if not self.airtable:
+            return set()
+        
+        try:
+            # Get ALL records from Airtable (normalized names)
+            all_records = self.karma_table.all()
+            analyzed_subs = set()
+            
+            for record in all_records:
+                fields = record['fields']
+                # Check if it has been analyzed (has effectiveness score)
+                if fields.get('Effectiveness_Score') is not None:
+                    # Store normalized name
+                    if fields.get('Subreddit'):
+                        analyzed_subs.add(fields['Subreddit'].lower())
+                    # Also store display name normalized
+                    if fields.get('Display_Name'):
+                        analyzed_subs.add(fields['Display_Name'].lower())
+            
+            logging.info(f"Found {len(analyzed_subs)} already analyzed subreddits in Airtable")
+            return analyzed_subs
+            
+        except Exception as e:
+            logging.error(f"Error fetching analyzed subreddits from Airtable: {e}")
+            return set()
+
+    def check_if_recently_analyzed(self, subreddit_name: str, days_threshold: int = 7) -> bool:
+        """Check if subreddit was analyzed recently"""
+        if not self.airtable:
+            return False
+        
+        try:
+            normalized = self.normalize_subreddit_name(subreddit_name)
+            existing_record = self.get_existing_record(normalized)
+            
+            if existing_record:
+                fields = existing_record['fields']
+                # Check if has effectiveness score (means it was analyzed)
+                if fields.get('Effectiveness_Score') is not None:
+                    # Check how recent
+                    last_analyzed = fields.get('Last_Analyzed', '2000-01-01')
+                    try:
+                        if 'T' in last_analyzed:
+                            last_date = datetime.fromisoformat(last_analyzed.replace('Z', '+00:00'))
+                        else:
+                            last_date = datetime.strptime(last_analyzed, '%Y-%m-%d')
+                        
+                        days_since = (datetime.now() - last_date.replace(tzinfo=None)).days
+                        
+                        if days_since <= days_threshold:
+                            logging.info(f"Skipping {subreddit_name} - analyzed {days_since} days ago")
+                            return True
+                    except:
+                        pass
+            
+            return False
+            
+        except Exception as e:
+            logging.error(f"Error checking if {subreddit_name} was analyzed: {e}")
+            return False
 
     def discover_subreddits_from_seed(self, seed_subreddit: str, 
                                     max_users: int = 20,
                                     max_subreddits_per_user: int = 10,
                                     full_analysis: bool = True,
-                                    analyze_all: bool = True) -> Dict[str, Any]:
-        """
-        Enhanced 4-step discovery process with user selection info
-        """
+                                    analyze_all: bool = True,
+                                    skip_existing: bool = True) -> Dict[str, Any]:
+        """Enhanced discovery that skips already-analyzed subreddits"""
         try:
             results = {
                 'seed_subreddit': seed_subreddit,
                 'users_analyzed': [],
-                'user_selection_method': '',
                 'discovered_subreddits': [],
+                'skipped_existing': [],
                 'stats_collected': [],
                 'errors': []
             }
+            
+            # STEP 0: Get already analyzed subreddits from Airtable
+            already_analyzed = set()
+            if skip_existing and self.airtable:
+                already_analyzed = self.get_all_analyzed_subreddits()
+                logging.info(f"Will skip {len(already_analyzed)} already-analyzed subreddits")
             
             # Step 1: Get DIVERSE users (AUTHORS + TOP COMMENTERS)
             logging.info(f"Step 1: Getting diverse users from r/{seed_subreddit}")
@@ -1814,104 +1881,228 @@ class RedditAnalyzer:
                 reverse=True
             )#[:100]  # Increased from 30 to 100!
             
-            # Step 4: FULL analysis for ALL discovered subreddits with CONCURRENT processing
+            # Step 4: Filter and analyze discovered subreddits
+            logging.info("Step 4: Filtering and analyzing discovered subreddits")
+
+            # Get already analyzed subreddits from Airtable
+            already_analyzed = set()
+            if skip_existing and self.airtable:
+                already_analyzed = self.get_all_analyzed_subreddits()
+                logging.info(f"Will skip {len(already_analyzed)} already-analyzed subreddits")
+
+            # Sort discovered subs by user overlap and engagement
+            sorted_subs = sorted(
+                discovered_subs.items(),
+                key=lambda x: (len(x[1]['users']) * 2 + x[1].get('avg_discovered_score', 0) / 10),
+                reverse=True
+            )
+
+            # Filter out already analyzed subreddits
+            subs_to_analyze = []
+            subs_skipped = []
+
+            for sub_normalized, sub_data in sorted_subs:
+                # Skip user profiles
+                if sub_data['display_name'].startswith('u_'):
+                    continue
+                
+                # Check if already analyzed (by normalized name)
+                if skip_existing and sub_normalized in already_analyzed:
+                    logging.info(f"Skipping {sub_data['display_name']} - already in Airtable")
+                    subs_skipped.append(sub_data['display_name'])
+                    results['skipped_existing'].append({
+                        'display_name': sub_data['display_name'],
+                        'reason': 'already_analyzed',
+                        'user_overlap': len(sub_data['users'])
+                    })
+                    continue
+                
+                # Also check by display name
+                if skip_existing and sub_data['display_name'].lower() in already_analyzed:
+                    logging.info(f"Skipping {sub_data['display_name']} - already in Airtable")
+                    subs_skipped.append(sub_data['display_name'])
+                    results['skipped_existing'].append({
+                        'display_name': sub_data['display_name'],
+                        'reason': 'already_analyzed',
+                        'user_overlap': len(sub_data['users'])
+                    })
+                    continue
+                
+                # Check if recently analyzed (within 7 days)
+                if skip_existing and self.check_if_recently_analyzed(sub_data['display_name'], days_threshold=7):
+                    logging.info(f"Skipping {sub_data['display_name']} - recently analyzed")
+                    subs_skipped.append(sub_data['display_name'])
+                    results['skipped_existing'].append({
+                        'display_name': sub_data['display_name'],
+                        'reason': 'recently_analyzed',
+                        'user_overlap': len(sub_data['users'])
+                    })
+                    continue
+                
+                # Add to list to analyze
+                subs_to_analyze.append((sub_normalized, sub_data))
+
+            logging.info(f"After filtering: {len(subs_to_analyze)} to analyze, {len(subs_skipped)} skipped")
+
+            # Determine how many to analyze
             if analyze_all:
-                logging.info(f"Step 4: Concurrent analysis of ALL {len(sorted_subs)} discovered subreddits")
-                analysis_limit = len(sorted_subs)  # Analyze ALL, not just top 50
+                analysis_limit = len(subs_to_analyze)
+                logging.info(f"Analyze all mode: will analyze all {analysis_limit} new subreddits")
             else:
-                logging.info(f"Step 4: Concurrent analysis of top 50 subreddits")
-                analysis_limit = 50
+                analysis_limit = min(50, len(subs_to_analyze))
+                logging.info(f"Standard mode: will analyze top {analysis_limit} subreddits")
 
-            # Process in TRULY concurrent batches
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = {}
-                analyzed_count = 0
+            # Only proceed if there are subs to analyze
+            if not subs_to_analyze:
+                logging.info("No new subreddits to analyze - all already in Airtable!")
+                return {
+                    'success': True,
+                    'summary': {
+                        'users_analyzed': len(results['users_analyzed']),
+                        'subreddits_discovered': len(sorted_subs),
+                        'already_in_airtable': len(subs_skipped),
+                        'new_subreddits_analyzed': 0,
+                        'skipped': len(results['skipped_existing']),
+                        'errors': 0
+                    },
+                    'details': results
+                }
+
+            # Process the subreddits that need analysis
+            logging.info(f"Starting analysis of {min(analysis_limit, len(subs_to_analyze))} subreddits")
+
+            # CRITICAL: Rate limiting configuration
+            BATCH_SIZE = 3   # Process only 3 at a time
+            MAX_WORKERS = 1   # Single threaded to avoid rate limits
+            DELAY_BETWEEN_SUBS = 2  # 2 seconds between each subreddit
+            DELAY_BETWEEN_BATCHES = 15  # 15 seconds between batches
+
+            analyzed_count = 0
+            batch_number = 0
+
+            # Process in small batches to avoid rate limiting
+            for batch_start in range(0, min(analysis_limit, len(subs_to_analyze)), BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, analysis_limit, len(subs_to_analyze))
+                batch_subs = subs_to_analyze[batch_start:batch_end]
+                batch_number += 1
                 
-                for sub_normalized, sub_data in sorted_subs[:analysis_limit]:
-                    if sub_data['display_name'].startswith('u_'):
-                        continue
+                logging.info(f"Processing batch {batch_number}: subreddits {batch_start+1}-{batch_end}")
+                
+                # Delay between batches (except first batch)
+                if batch_start > 0:
+                    logging.info(f"Waiting {DELAY_BETWEEN_BATCHES}s between batches to avoid rate limit")
+                    time.sleep(DELAY_BETWEEN_BATCHES)
+                
+                # Process this batch with limited concurrency
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    futures = {}
+                    
+                    for i, (sub_normalized, sub_data) in enumerate(batch_subs):
+                        analyzed_count += 1
                         
-                    analyzed_count += 1
-                    
-                    # Submit analysis task
-                    if analyzed_count <= 20 and full_analysis:
-                        # Full analysis with timing for top 20
-                        future = executor.submit(
-                            self.analyze_subreddit_with_timing, 
-                            sub_data['display_name'], 
-                            7
-                        )
-                    else:
-                        # Quick analysis for the rest (faster)
-                        future = executor.submit(
-                            self.analyze_subreddit_enhanced,
-                            sub_data['display_name'],
-                            3
-                        )
-                    
-                    futures[future] = (sub_normalized, sub_data, analyzed_count)
-                
-                logging.info(f"Submitted {len(futures)} analysis tasks for concurrent processing")
-                
-                # Process completed futures as they complete
-                completed_count = 0
-                for future in as_completed(futures):
-                    sub_normalized, sub_data, task_number = futures[future]
-                    completed_count += 1
-                    
-                    try:
-                        analysis = future.result()
+                        # Delay between submissions within batch
+                        if i > 0:
+                            time.sleep(DELAY_BETWEEN_SUBS)
                         
-                        if analysis.get('success'):
-                            record_data = {
-                                'normalized_name': sub_normalized,
-                                'display_name': sub_data['display_name'],
-                                'is_nsfw': sub_data['is_nsfw'],
-                                'tag': sub_data['tag'],
-                                'discovered_from': seed_subreddit,
-                                'user_overlap_count': len(sub_data['users']),
-                                'effectiveness_score': analysis.get('effectiveness_score', 0),
-                                'subscribers': analysis.get('subscribers', 0),
-                                'median_score': analysis.get('median_score_per_post', 0),
-                                'avg_comments': analysis.get('avg_comments_per_post', 0),
-                                'avg_posts_per_day': analysis.get('avg_posts_per_day', 0),
-                                'consistency_score': analysis.get('consistency_analysis', {}).get('consistency_score', 0),
-                                'top_post': analysis.get('top_post', {}),
-                                'posting_times': analysis.get('posting_times', {}) if task_number <= 20 and full_analysis else {},
-                                'avg_discovered_score': sub_data.get('avg_discovered_score', 0),
-                                'analysis_depth': 'full' if task_number <= 20 else 'quick'
-                            }
-                            
-                            results['discovered_subreddits'].append(record_data)
-                            
-                            # Save to Airtable in background (non-blocking)
-                            if self.airtable:
-                                try:
-                                    self.save_discovered_to_airtable(record_data)
-                                except Exception as e:
-                                    logging.warning(f"Failed to save {sub_data['display_name']} to Airtable: {e}")
-                            
-                            results['stats_collected'].append(sub_data['display_name'])
-                            
-                            # Log progress every 10 completed
-                            if completed_count % 10 == 0:
-                                logging.info(f"Completed {completed_count}/{len(futures)} concurrent analyses")
+                        logging.info(f"Submitting analysis {analyzed_count}/{min(analysis_limit, len(subs_to_analyze))}: {sub_data['display_name']}")
+                        
+                        # Choose analysis depth
+                        if analyzed_count <= 20 and full_analysis:
+                            # Full analysis with timing for top 20
+                            future = executor.submit(
+                                self.analyze_subreddit_with_timing,
+                                sub_data['display_name'],
+                                7  # 7 days of data
+                            )
+                            analysis_type = 'full'
                         else:
-                            logging.warning(f"Failed to analyze {sub_data['display_name']}: {analysis.get('error', 'Unknown error')}")
+                            # Quick analysis for the rest
+                            future = executor.submit(
+                                self.analyze_subreddit_enhanced,
+                                sub_data['display_name'],
+                                3  # Only 3 days of data for speed
+                            )
+                            analysis_type = 'quick'
+                        
+                        futures[future] = (sub_normalized, sub_data, analyzed_count, analysis_type)
+                    
+                    # Wait for batch to complete
+                    completed_in_batch = 0
+                    for future in as_completed(futures):
+                        sub_normalized, sub_data, task_number, analysis_type = futures[future]
+                        completed_in_batch += 1
+                        
+                        try:
+                            # Get result with timeout
+                            analysis = future.result(timeout=60)
+                            
+                            if analysis.get('success'):
+                                logging.info(f"✓ Successfully analyzed {sub_data['display_name']} (score: {analysis.get('effectiveness_score', 0)})")
+                                
+                                # Build record data
+                                record_data = {
+                                    'normalized_name': sub_normalized,
+                                    'display_name': sub_data['display_name'],
+                                    'is_nsfw': sub_data.get('is_nsfw', False),
+                                    'tag': sub_data.get('tag', 'Unknown'),
+                                    'discovered_from': seed_subreddit,
+                                    'user_overlap_count': len(sub_data['users']),
+                                    'effectiveness_score': analysis.get('effectiveness_score', 0),
+                                    'subscribers': analysis.get('subscribers', 0),
+                                    'median_score': analysis.get('median_score_per_post', 0),
+                                    'avg_comments': analysis.get('avg_comments_per_post', 0),
+                                    'avg_posts_per_day': analysis.get('avg_posts_per_day', 0),
+                                    'consistency_score': analysis.get('consistency_analysis', {}).get('consistency_score', 0),
+                                    'top_post': analysis.get('top_post', {}),
+                                    'posting_times': analysis.get('posting_times', {}) if analysis_type == 'full' else {},
+                                    'analysis_depth': analysis_type,
+                                    'batch_number': batch_number
+                                }
+                                
+                                results['discovered_subreddits'].append(record_data)
+                                results['stats_collected'].append(sub_data['display_name'])
+                                
+                                # Save to Airtable immediately
+                                if self.airtable:
+                                    try:
+                                        self.save_discovered_to_airtable(record_data)
+                                        logging.info(f"✓ Saved {sub_data['display_name']} to Airtable")
+                                    except Exception as e:
+                                        logging.warning(f"Failed to save {sub_data['display_name']} to Airtable: {e}")
+                            else:
+                                logging.warning(f"✗ Failed to analyze {sub_data['display_name']}: {analysis.get('error', 'Unknown error')}")
+                                results['errors'].append(f"{sub_data['display_name']}: {analysis.get('error', 'Unknown')}")
+                                
+                        except concurrent.futures.TimeoutError:
+                            logging.error(f"✗ Timeout analyzing {sub_data['display_name']}")
+                            results['errors'].append(f"{sub_data['display_name']}: Timeout")
+                            
+                        except Exception as e:
+                            error_str = str(e)
+                            if "429" in error_str:
+                                logging.error(f"✗ RATE LIMITED on {sub_data['display_name']}! Waiting 30 seconds...")
+                                time.sleep(30)  # Wait 30 seconds on rate limit
+                                results['errors'].append(f"{sub_data['display_name']}: Rate limited")
+                            else:
+                                logging.error(f"✗ Error analyzing {sub_data['display_name']}: {e}")
+                                results['errors'].append(f"{sub_data['display_name']}: {error_str[:50]}")
+                        
+                        logging.info(f"Batch {batch_number} progress: {completed_in_batch}/{len(batch_subs)}")
                 
-                    except Exception as e:
-                        logging.warning(f"Exception analyzing {sub_data.get('display_name', 'unknown')}: {e}")
-                        results['errors'].append(f"Stats for {sub_data.get('display_name', 'unknown')}: {str(e)}")
+                logging.info(f"Batch {batch_number} complete. Total analyzed: {len(results['stats_collected'])}")
 
-            logging.info(f"Concurrent analysis complete: {len(results['stats_collected'])} subreddits analyzed")
-            
-            # MISSING PART - Return the final results with summary
+            # Final summary
+            logging.info(f"Discovery complete: {len(results['stats_collected'])} new subreddits analyzed, {len(subs_skipped)} skipped")
+
+            # Return comprehensive results
             return {
                 'success': True,
                 'summary': {
                     'users_analyzed': len(results['users_analyzed']),
                     'subreddits_discovered': len(sorted_subs),
-                    'stats_collected': len(results['stats_collected']),
+                    'already_in_airtable': len(subs_skipped),
+                    'new_subreddits_analyzed': len(results['stats_collected']),
+                    'skipped': len(results['skipped_existing']),
                     'errors': len(results['errors'])
                 },
                 'details': results
