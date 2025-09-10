@@ -15,7 +15,8 @@ import pytz
 from pyairtable import Api
 import statistics
 from contextlib import contextmanager
-from threading import Semaphore
+import uuid
+from threading import Semaphore, Thread
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 
@@ -2259,6 +2260,8 @@ class RedditAnalyzer:
 # Initialize analyzer
 analyzer = RedditAnalyzer()
 
+discovery_jobs = {}
+
 # Store for progressive analysis sessions
 analysis_sessions = {}
 
@@ -2918,6 +2921,93 @@ def analyze_flairs():
                 'error': f'Analysis failed: {error_message}'
             }), 500
         
+
+@app.route('/discover/start', methods=['POST'])
+def start_discover():
+    """Start discovery job and return job ID immediately"""
+    data = request.json
+    job_id = str(uuid.uuid4())
+    
+    # Validate subreddit first
+    seed_subreddit = data.get('subreddit')
+    if not seed_subreddit:
+        return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
+    
+    validation = validate_subreddit(seed_subreddit)
+    if not validation['valid']:
+        return jsonify({
+            'success': False,
+            'error': validation['message'],
+            'error_type': validation['error']
+        }), 400
+    
+    # Initialize job status
+    discovery_jobs[job_id] = {
+        'status': 'running',
+        'progress': 'Starting discovery...',
+        'started_at': datetime.utcnow().isoformat(),
+        'subreddit': seed_subreddit,
+        'result': None,
+        'error': None
+    }
+    
+    # Run discovery in background thread
+    def run_discovery_job():
+        try:
+            result = analyzer.discover_subreddits_from_seed(
+                seed_subreddit,
+                data.get('max_users', 20),
+                data.get('max_subreddits', 10),
+                data.get('full_analysis', True),
+                data.get('analyze_all', True),
+                data.get('skip_existing', True)
+            )
+            
+            discovery_jobs[job_id]['status'] = 'complete'
+            discovery_jobs[job_id]['result'] = result
+            discovery_jobs[job_id]['completed_at'] = datetime.utcnow().isoformat()
+            
+        except Exception as e:
+            discovery_jobs[job_id]['status'] = 'failed'
+            discovery_jobs[job_id]['error'] = str(e)
+            logging.error(f"Discovery job {job_id} failed: {e}")
+    
+    thread = Thread(target=run_discovery_job)
+    thread.daemon = True
+    thread.start()
+    
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'status': 'started',
+        'message': f"Discovery started for r/{seed_subreddit}"
+    })
+
+@app.route('/discover/status/<job_id>', methods=['GET'])
+def check_discover_status(job_id):
+    """Check status of discovery job"""
+    if job_id not in discovery_jobs:
+        return jsonify({'success': False, 'error': 'Job not found'}), 404
+    
+    job = discovery_jobs[job_id]
+    
+    # Clean up old completed jobs (older than 1 hour)
+    if job.get('completed_at'):
+        completed_time = datetime.fromisoformat(job['completed_at'])
+        if (datetime.utcnow() - completed_time).seconds > 3600:
+            del discovery_jobs[job_id]
+            return jsonify({'success': False, 'error': 'Job expired'}), 404
+    
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'status': job['status'],
+        'subreddit': job['subreddit'],
+        'progress': job.get('progress'),
+        'result': job.get('result') if job['status'] == 'complete' else None,
+        'error': job.get('error')
+    })
+
 
 @app.route('/discover', methods=['POST'])
 def discover_endpoint():
