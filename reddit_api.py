@@ -3,6 +3,7 @@ import praw
 from prawcore.exceptions import RequestException, ResponseException
 from datetime import datetime, timedelta, timezone
 import json
+import pickle
 import os
 from typing import List, Dict, Any, Set, Tuple
 import logging
@@ -608,6 +609,7 @@ class RedditAnalyzer:
             result = {
                 'success': True,
                 'subreddit': subreddit_name,
+                'subreddit_link': f"https://reddit.com/r/{subreddit_name}",
                 'subscribers': subscribers,
                 'avg_posts_per_day': round(avg_posts_per_day, 2),
                 'avg_score_per_post': round(avg_score_per_post, 2),  # Original mean
@@ -1035,6 +1037,7 @@ class RedditAnalyzer:
                         logging.info(f"Using cached karma data for {subreddit_name}")
                         return {
                             'success': True,
+                            'subreddit_link': f"https://reddit.com/r/{subreddit_name}",
                             'from_cache': True,
                             'post_karma_min': record.get('Post_Karma_Min', 0),
                             'comment_karma_min': record.get('Comment_Karma_Min', 0),
@@ -1678,6 +1681,7 @@ class RedditAnalyzer:
                                     full_analysis: bool = True,
                                     analyze_all: bool = True,
                                     skip_existing: bool = True,
+                                    refresh_mode: bool = False,
                                     progress_callback=None) -> Dict[str, Any]:
         """Enhanced discovery that skips already-analyzed subreddits"""
         try:
@@ -1969,9 +1973,9 @@ class RedditAnalyzer:
 
 
             # Determine how many to analyze
-            if analyze_all:
+            if analyze_all or refresh_mode:  # Add refresh_mode check
                 analysis_limit = len(subs_to_analyze)
-                logging.info(f"Analyze all mode: will analyze all {analysis_limit} new subreddits")
+                logging.info(f"Analyze all/refresh mode: will analyze all {analysis_limit} subreddits")
             else:
                 analysis_limit = min(50, len(subs_to_analyze))
                 logging.info(f"Standard mode: will analyze top {analysis_limit} subreddits")
@@ -2293,6 +2297,28 @@ class RedditAnalyzer:
 analyzer = RedditAnalyzer()
 
 discovery_jobs = {}
+JOBS_FILE = '/tmp/discovery_jobs.json'
+
+def load_discovery_jobs():
+    """Load jobs from persistent storage"""
+    try:
+        if os.path.exists(JOBS_FILE):
+            with open(JOBS_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logging.error(f"Error loading jobs: {e}")
+    return {}
+
+def save_discovery_jobs(jobs):
+    """Save jobs to persistent storage"""
+    try:
+        with open(JOBS_FILE, 'w') as f:
+            json.dump(jobs, f)
+    except Exception as e:
+        logging.error(f"Error saving jobs: {e}")
+
+# Load existing jobs on startup
+discovery_jobs = load_discovery_jobs()
 
 # Store for progressive analysis sessions
 analysis_sessions = {}
@@ -2494,6 +2520,94 @@ def analyze_user_endpoint():
     
     result = analyzer.analyze_user(username, days, limit)
     return jsonify(result)
+
+@app.route('/user-subreddits', methods=['POST'])
+def user_subreddits_endpoint():
+    """Get all subreddits a user posts in"""
+    data = request.json
+    username = data.get('username')
+    days = data.get('days', 30)
+    
+    if not username:
+        return jsonify({'success': False, 'error': 'No username provided'}), 400
+    
+    # Remove u/ prefix if present
+    username = username.replace('u/', '').replace('/u/', '')
+    
+    try:
+        user = analyzer.enhanced_safe_reddit_call(lambda: analyzer.reddit.redditor(username))
+        
+        # Check if user exists
+        try:
+            _ = analyzer.enhanced_safe_reddit_call(lambda: user.name)
+        except:
+            return jsonify({'success': False, 'error': f'User u/{username} not found'}), 400
+        
+        # Collect subreddit data
+        subreddit_stats = defaultdict(lambda: {
+            'posts': 0, 
+            'comments': 0, 
+            'total_score': 0,
+            'last_activity': None,
+            'link': None
+        })
+        
+        date_threshold = datetime.utcnow() - timedelta(days=days)
+        
+        # Analyze submissions
+        for submission in user.submissions.new(limit=100):
+            if datetime.utcfromtimestamp(submission.created_utc) < date_threshold:
+                continue
+            
+            sub_name = submission.subreddit.display_name
+            subreddit_stats[sub_name]['posts'] += 1
+            subreddit_stats[sub_name]['total_score'] += submission.score
+            subreddit_stats[sub_name]['link'] = f"https://reddit.com/r/{sub_name}"
+            
+            if not subreddit_stats[sub_name]['last_activity']:
+                subreddit_stats[sub_name]['last_activity'] = datetime.utcfromtimestamp(submission.created_utc).isoformat()
+        
+        # Analyze comments
+        for comment in user.comments.new(limit=100):
+            if datetime.utcfromtimestamp(comment.created_utc) < date_threshold:
+                continue
+            
+            sub_name = comment.subreddit.display_name
+            subreddit_stats[sub_name]['comments'] += 1
+            subreddit_stats[sub_name]['total_score'] += comment.score
+            subreddit_stats[sub_name]['link'] = f"https://reddit.com/r/{sub_name}"
+            
+            if not subreddit_stats[sub_name]['last_activity']:
+                subreddit_stats[sub_name]['last_activity'] = datetime.utcfromtimestamp(comment.created_utc).isoformat()
+        
+        # Format results
+        results = []
+        for sub_name, stats in subreddit_stats.items():
+            results.append({
+                'subreddit': sub_name,
+                'link': stats['link'],
+                'posts': stats['posts'],
+                'comments': stats['comments'],
+                'total_activity': stats['posts'] + stats['comments'],
+                'total_score': stats['total_score'],
+                'last_activity': stats['last_activity']
+            })
+        
+        # Sort by total activity
+        results.sort(key=lambda x: x['total_activity'], reverse=True)
+        
+        return jsonify({
+            'success': True,
+            'username': username,
+            'user_link': f"https://reddit.com/u/{username}",
+            'days_analyzed': days,
+            'subreddits': results,
+            'total_subreddits': len(results)
+        })
+        
+    except Exception as e:
+        logging.error(f"Error analyzing user {username}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/analyze-multiple', methods=['POST'])
 def analyze_multiple_endpoint():
@@ -2982,6 +3096,7 @@ def start_discover():
         'result': None,
         'error': None
     }
+    save_discovery_jobs(discovery_jobs)  # Save immediately
     
     def run_discovery_job():
         try:
@@ -2990,6 +3105,7 @@ def start_discover():
                 discovery_jobs[job_id]['progress'] = message
                 discovery_jobs[job_id]['percentage'] = percentage
                 discovery_jobs[job_id]['stage'] = stage
+                save_discovery_jobs(discovery_jobs)  # Save progress updates
             
             update_progress('starting', 5, 'Initializing discovery...')
             
@@ -3001,6 +3117,7 @@ def start_discover():
                 data.get('full_analysis', True),
                 data.get('analyze_all', True),
                 data.get('skip_existing', True),
+                data.get('refresh_mode', False),  # Add this line
                 progress_callback=lambda p: update_progress(p['stage'], p['percentage'], p['message'])
             )
             
@@ -3008,10 +3125,12 @@ def start_discover():
             discovery_jobs[job_id]['result'] = result
             discovery_jobs[job_id]['percentage'] = 100
             discovery_jobs[job_id]['completed_at'] = datetime.utcnow().isoformat()
+            save_discovery_jobs(discovery_jobs)  # Save on completion
             
         except Exception as e:
             discovery_jobs[job_id]['status'] = 'failed'
             discovery_jobs[job_id]['error'] = str(e)
+            save_discovery_jobs(discovery_jobs)  # Save on failure
             logging.error(f"Discovery job {job_id} failed: {e}")
 
     # START the background thread
@@ -3031,6 +3150,11 @@ def start_discover():
 @app.route('/discover/status/<job_id>', methods=['GET'])
 def check_discover_status(job_id):
     """Check status of discovery job with percentage"""
+    global discovery_jobs
+    
+    # Reload jobs in case they were updated by another worker
+    discovery_jobs = load_discovery_jobs()
+    
     if job_id not in discovery_jobs:
         return jsonify({'success': False, 'error': 'Job not found'}), 404
     
@@ -3038,10 +3162,14 @@ def check_discover_status(job_id):
     
     # Clean up old completed jobs (older than 1 hour)
     if job.get('completed_at'):
-        completed_time = datetime.fromisoformat(job['completed_at'])
-        if (datetime.utcnow() - completed_time).seconds > 3600:
-            del discovery_jobs[job_id]
-            return jsonify({'success': False, 'error': 'Job expired'}), 404
+        try:
+            completed_time = datetime.fromisoformat(job['completed_at'])
+            if (datetime.utcnow() - completed_time).seconds > 3600:
+                del discovery_jobs[job_id]
+                save_discovery_jobs(discovery_jobs)
+                return jsonify({'success': False, 'error': 'Job expired'}), 404
+        except:
+            pass  # If datetime parsing fails, keep the job
     
     return jsonify({
         'success': True,
@@ -3049,8 +3177,8 @@ def check_discover_status(job_id):
         'status': job['status'],
         'subreddit': job['subreddit'],
         'progress': job.get('progress'),
-        'percentage': job.get('percentage', 0),  # Add percentage
-        'stage': job.get('stage', 'unknown'),    # Add stage
+        'percentage': job.get('percentage', 0),
+        'stage': job.get('stage', 'unknown'),
         'result': job.get('result') if job['status'] == 'complete' else None,
         'error': job.get('error')
     })
@@ -3064,7 +3192,9 @@ def discover_endpoint():
     max_users = min(data.get('max_users', 20), 50)
     max_subreddits = min(data.get('max_subreddits', 10), 20)
     full_analysis = data.get('full_analysis', True)
-    analyze_all = data.get('analyze_all', True)  # New parameter
+    analyze_all = data.get('analyze_all', True)
+    skip_existing = data.get('skip_existing', True)
+    refresh_mode = data.get('refresh_mode', False)  # Add this line
     
     if not seed_subreddit:
         return jsonify({'success': False, 'error': 'No subreddit provided'}), 400
@@ -3082,10 +3212,12 @@ def discover_endpoint():
         max_users, 
         max_subreddits,
         full_analysis,
-        analyze_all  # Pass the new parameter
+        analyze_all,
+        skip_existing,
+        refresh_mode  # Add this parameter
     )
     
-    return jsonify(result)    
+    return jsonify(result)   
 
 @app.route('/stripe-webhook', methods=['POST'])
 async def stripe_webhook():
