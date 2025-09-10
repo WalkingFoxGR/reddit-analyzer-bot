@@ -2994,7 +2994,6 @@ def start_discover():
             update_progress('starting', 5, 'Initializing discovery...')
             
             # Call the discovery with progress tracking
-            # We need to modify the discover_subreddits_from_seed to accept a progress callback
             result = analyzer.discover_subreddits_from_seed(
                 seed_subreddit,
                 data.get('max_users', 20),
@@ -3014,6 +3013,20 @@ def start_discover():
             discovery_jobs[job_id]['status'] = 'failed'
             discovery_jobs[job_id]['error'] = str(e)
             logging.error(f"Discovery job {job_id} failed: {e}")
+
+    # START the background thread
+    thread = threading.Thread(target=run_discovery_job)
+    thread.daemon = True  # Dies when main thread dies
+    thread.start()
+    
+    # RETURN the response immediately
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'status': 'started',
+        'subreddit': seed_subreddit,
+        'message': 'Discovery job started. Use /discover/status/<job_id> to check progress.'
+    })
 
 @app.route('/discover/status/<job_id>', methods=['GET'])
 def check_discover_status(job_id):
