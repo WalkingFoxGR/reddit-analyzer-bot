@@ -1677,7 +1677,8 @@ class RedditAnalyzer:
                                     max_subreddits_per_user: int = 10,
                                     full_analysis: bool = True,
                                     analyze_all: bool = True,
-                                    skip_existing: bool = True) -> Dict[str, Any]:
+                                    skip_existing: bool = True,
+                                    progress_callback=None) -> Dict[str, Any]:
         """Enhanced discovery that skips already-analyzed subreddits"""
         try:
             results = {
@@ -1688,12 +1689,25 @@ class RedditAnalyzer:
                 'stats_collected': [],
                 'errors': []
             }
+
+            # Add this helper function right here
+            def report_progress(stage, percentage, message):
+                if progress_callback:
+                    progress_callback({
+                        'stage': stage,
+                        'percentage': percentage,
+                        'message': message
+                    })
+            
+            report_progress('starting', 5, 'Initializing discovery...')
             
             # STEP 0: Get already analyzed subreddits from Airtable
             already_analyzed = set()
             if skip_existing and self.airtable:
                 already_analyzed = self.get_all_analyzed_subreddits()
                 logging.info(f"Will skip {len(already_analyzed)} already-analyzed subreddits")
+                report_progress('checking_existing', 10, f'Found {len(already_analyzed)} existing subreddits')
+
             
             # Step 1: Get DIVERSE users (AUTHORS + TOP COMMENTERS)
             logging.info(f"Step 1: Getting diverse users from r/{seed_subreddit}")
@@ -1764,6 +1778,8 @@ class RedditAnalyzer:
             results['users_analyzed'] = selected_users
             results['user_selection_method'] = f"Selected {authors_selected} post authors and {commenters_selected} top commenters"
             logging.info(f"Selected {len(selected_users)} diverse users")
+            report_progress('users_collected', 20, f'Collected {len(selected_users)} users to analyze')
+
             
             # Step 2: Find where these users post - FIXED VERSION
             logging.info("Step 2: Deep analysis of user activity")
@@ -1777,6 +1793,9 @@ class RedditAnalyzer:
             })
             
             for i, username in enumerate(selected_users):
+                # Add this at the start of the loop:
+                percentage = 20 + int(20 * (i / len(selected_users)))
+                report_progress('analyzing_users', percentage, f'Analyzing user {i+1}/{len(selected_users)}: {username}')
                 try:
                     user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(username))
                     subs_found = 0
@@ -1897,6 +1916,8 @@ class RedditAnalyzer:
                 key=lambda x: (len(x[1]['users']) * 2 + x[1].get('avg_discovered_score', 0) / 10),
                 reverse=True
             )
+            report_progress('filtering', 45, f'Found {len(sorted_subs)} potential subreddits to analyze')
+
 
             # Filter out already analyzed subreddits
             subs_to_analyze = []
@@ -1944,6 +1965,8 @@ class RedditAnalyzer:
                 subs_to_analyze.append((sub_normalized, sub_data))
 
             logging.info(f"After filtering: {len(subs_to_analyze)} to analyze, {len(subs_skipped)} skipped")
+            report_progress('ready_to_analyze', 50, f'Will analyze {len(subs_to_analyze)} new subreddits')
+
 
             # Determine how many to analyze
             if analyze_all:
@@ -2032,6 +2055,14 @@ class RedditAnalyzer:
                     for future in as_completed(futures):
                         sub_normalized, sub_data, task_number, analysis_type = futures[future]
                         completed_in_batch += 1
+
+                        # Add progress calculation:
+                        total_analyzed = len(results['stats_collected'])
+                        total_to_analyze = min(analysis_limit, len(subs_to_analyze))
+                        percentage = 50 + int(50 * (total_analyzed / max(total_to_analyze, 1)))
+                        report_progress('analyzing_subreddits', percentage, 
+                                    f'Analyzed {total_analyzed}/{total_to_analyze}: r/{sub_data["display_name"]}')
+
                         
                         try:
                             # Get result with timeout
@@ -2094,6 +2125,7 @@ class RedditAnalyzer:
 
             # Final summary
             logging.info(f"Discovery complete: {len(results['stats_collected'])} new subreddits analyzed, {len(subs_skipped)} skipped")
+            report_progress('complete', 100, f'Discovery complete! Analyzed {len(results["stats_collected"])} new subreddits')
 
             # Return comprehensive results
             return {
@@ -2951,41 +2983,41 @@ def start_discover():
         'error': None
     }
     
-    # Run discovery in background thread
     def run_discovery_job():
         try:
+            # Track progress stages
+            def update_progress(stage, percentage, message):
+                discovery_jobs[job_id]['progress'] = message
+                discovery_jobs[job_id]['percentage'] = percentage
+                discovery_jobs[job_id]['stage'] = stage
+            
+            update_progress('starting', 5, 'Initializing discovery...')
+            
+            # Call the discovery with progress tracking
+            # We need to modify the discover_subreddits_from_seed to accept a progress callback
             result = analyzer.discover_subreddits_from_seed(
                 seed_subreddit,
                 data.get('max_users', 20),
                 data.get('max_subreddits', 10),
                 data.get('full_analysis', True),
                 data.get('analyze_all', True),
-                data.get('skip_existing', True)
+                data.get('skip_existing', True),
+                progress_callback=lambda p: update_progress(p['stage'], p['percentage'], p['message'])
             )
             
             discovery_jobs[job_id]['status'] = 'complete'
             discovery_jobs[job_id]['result'] = result
+            discovery_jobs[job_id]['percentage'] = 100
             discovery_jobs[job_id]['completed_at'] = datetime.utcnow().isoformat()
             
         except Exception as e:
             discovery_jobs[job_id]['status'] = 'failed'
             discovery_jobs[job_id]['error'] = str(e)
             logging.error(f"Discovery job {job_id} failed: {e}")
-    
-    thread = Thread(target=run_discovery_job)
-    thread.daemon = True
-    thread.start()
-    
-    return jsonify({
-        'success': True,
-        'job_id': job_id,
-        'status': 'started',
-        'message': f"Discovery started for r/{seed_subreddit}"
-    })
 
 @app.route('/discover/status/<job_id>', methods=['GET'])
 def check_discover_status(job_id):
-    """Check status of discovery job"""
+    """Check status of discovery job with percentage"""
     if job_id not in discovery_jobs:
         return jsonify({'success': False, 'error': 'Job not found'}), 404
     
@@ -3004,6 +3036,8 @@ def check_discover_status(job_id):
         'status': job['status'],
         'subreddit': job['subreddit'],
         'progress': job.get('progress'),
+        'percentage': job.get('percentage', 0),  # Add percentage
+        'stage': job.get('stage', 'unknown'),    # Add stage
         'result': job.get('result') if job['status'] == 'complete' else None,
         'error': job.get('error')
     })
