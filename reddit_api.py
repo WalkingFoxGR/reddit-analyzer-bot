@@ -1973,7 +1973,8 @@ class RedditAnalyzer:
 
 
             # Determine how many to analyze
-            if analyze_all or refresh_mode:  # Add refresh_mode check
+            if analyze_all or refresh_mode:
+                # When refresh_mode is True, we want to analyze ALL discovered subs
                 analysis_limit = len(subs_to_analyze)
                 logging.info(f"Analyze all/refresh mode: will analyze all {analysis_limit} subreddits")
             else:
