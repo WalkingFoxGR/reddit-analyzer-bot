@@ -1610,6 +1610,83 @@ class RedditAnalyzer:
         except Exception as e:
             logging.error(f"Error analyzing user {username}: {e}")
             return {'success': False, 'error': str(e)}
+        
+    def get_user_subreddits(self, username: str, days: int = 30) -> Dict[str, Any]:
+        """Get all subreddits a user is active in"""
+        try:
+            user = self.enhanced_safe_reddit_call(lambda: self.reddit.redditor(username))
+            
+            # Check if user exists
+            try:
+                _ = self.enhanced_safe_reddit_call(lambda: user.name)
+            except:
+                return {'success': False, 'error': f'User u/{username} not found'}
+            
+            # Collect subreddit data
+            subreddit_stats = defaultdict(lambda: {
+                'posts': 0, 
+                'comments': 0, 
+                'total_score': 0,
+                'last_activity': None,
+                'link': None
+            })
+            
+            date_threshold = datetime.utcnow() - timedelta(days=days)
+            
+            # Analyze submissions
+            for submission in user.submissions.new(limit=100):
+                if datetime.utcfromtimestamp(submission.created_utc) < date_threshold:
+                    continue
+                
+                sub_name = submission.subreddit.display_name
+                subreddit_stats[sub_name]['posts'] += 1
+                subreddit_stats[sub_name]['total_score'] += submission.score
+                subreddit_stats[sub_name]['link'] = f"https://reddit.com/r/{sub_name}"
+                
+                if not subreddit_stats[sub_name]['last_activity']:
+                    subreddit_stats[sub_name]['last_activity'] = datetime.utcfromtimestamp(submission.created_utc).isoformat()
+            
+            # Analyze comments
+            for comment in user.comments.new(limit=100):
+                if datetime.utcfromtimestamp(comment.created_utc) < date_threshold:
+                    continue
+                
+                sub_name = comment.subreddit.display_name
+                subreddit_stats[sub_name]['comments'] += 1
+                subreddit_stats[sub_name]['total_score'] += comment.score
+                subreddit_stats[sub_name]['link'] = f"https://reddit.com/r/{sub_name}"
+                
+                if not subreddit_stats[sub_name]['last_activity']:
+                    subreddit_stats[sub_name]['last_activity'] = datetime.utcfromtimestamp(comment.created_utc).isoformat()
+            
+            # Format results
+            results = []
+            for sub_name, stats in subreddit_stats.items():
+                results.append({
+                    'subreddit': sub_name,
+                    'link': stats['link'],
+                    'posts': stats['posts'],
+                    'comments': stats['comments'],
+                    'total_activity': stats['posts'] + stats['comments'],
+                    'total_score': stats['total_score'],
+                    'last_activity': stats['last_activity']
+                })
+            
+            # Sort by total activity
+            results.sort(key=lambda x: x['total_activity'], reverse=True)
+            
+            return {
+                'success': True,
+                'username': username,
+                'user_link': f"https://reddit.com/u/{username}",
+                'days_analyzed': days,
+                'subreddits': results,
+                'total_subreddits': len(results)
+            }
+            
+        except Exception as e:
+            logging.error(f"Error analyzing user {username}: {e}")
+            return {'success': False, 'error': str(e)}        
     
 
     def get_all_analyzed_subreddits(self) -> Set[str]:
